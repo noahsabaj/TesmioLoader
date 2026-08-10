@@ -35,6 +35,8 @@ started with:
 | `needs` | resources the citizens buy in a shop | [11](11-needs.md) |
 | `walking` | how far a citizen walks | [12](12-walking.md) |
 | `buildings` | new buildings, written out of a config file | [13](13-buildings.md) |
+| `cities` | a per-city radius and shape | [14](14-cities.md) |
+| `daynight` | one sunrise and one sunset per calendar day | [15](15-daynight.md) |
 
 The split is not about safety. A plugin is in the same address space and can
 corrupt the process exactly as easily as the loader can — there is no sandbox
@@ -196,12 +198,18 @@ Two numbers, and the second one is a promise.
 
 | Constant | What | Now |
 |---|---|---|
-| `TSM_API_VERSION` | this header, bumped on **every** change to it | 3 |
+| `TSM_API_VERSION` | this header, bumped on **every** change to it | 4 |
 | `TSM_API_VERSION_MIN` | the oldest plugin this loader still initialises | 3 |
 
 The loader accepts `TSM_API_VERSION_MIN <= reported <= TSM_API_VERSION`. Version
 1 had no `Start` phase and carried the deposit registry in the host table; 2
-added the split; 3 grew the deposit service.
+added the split; 3 grew the deposit service; 4 appended `TsmHost::vfsRoot` -
+the actual folder file reads are redirected against, which is not always
+`baseDir\vfs` (see `ResolveVfsRoot` in `tesmioloader.cpp`) and which
+`plugins/deposits` had been reconstructing by hand and getting wrong. A
+compatible change, so `TSM_API_VERSION_MIN` did not move: a v3 plugin never
+reads that far into the table, and `tesmio_plugin.h`'s `TsmBind` only copies
+the field out when `host->structSize` says it is actually there.
 
 `TsmPluginApiVersion` is called **before** `TsmPluginInit` and `Init` is not
 called at all on a refusal. That ordering is the point: a plugin built against

@@ -163,6 +163,7 @@ belongs to.
 | `btf.py` | language files. `find <text>` resolves a label the game draws to its id, which is an immediate in the code and therefore a one-grep route to the UI function that draws it. `unpack`/`pack` convert a `.btf` to editable text and back, `patch` applies an overlay of a few ids to a stock file, `selftest` round-trips all twenty-one byte for byte |
 | `btf_gui.py` | the same two conversions as a window, for translators rather than for debugging. `btf_gui.bat` opens it. It imports `btf.py` rather than repeating it, captures the warnings `btf.py` writes to `stderr` — `None` under `pythonw` — into a log pane, and reads a packed file back before reporting success |
 | `nmf.py` | a mesh's submaterial names, so a cloned building's `.mtl` declares the right ones instead of guessing. `--mtl` prints a skeleton, `--nodes` lists `$COST_WORK_BUILDING_NODE` candidates |
+| `restable.py` | the engine's resource table replayed instruction by instruction: the exact contents of all 57 resource records, without the game running. `classes` and `record <name>` report; **`verify` rebuilds every record from the field set `plugins/resources` knows and diffs all 832 bytes** — 57 of 57 identical is what says the layout is complete. Re-run after a game update |
 
 ### Sanity check the decompiler
 
@@ -191,6 +192,44 @@ dll.D3DDisassemble(blob, len(blob), 0, None, ctypes.byref(out))   # out is an ID
 Do this before assuming a shader has to be patched. The minimap deposit overlay
 turned out to select its colour channel with a `dp4` against a float4 constant,
 which made the unused alpha channel reachable with no patch at all.
+
+## Replaying a builder, for a structure that has no symbols
+
+The technique that finally settled the resource record, after three years of
+"clone an existing one and hope". Worth reaching for whenever a structure is
+**filled by straight-line code with one block per instance** — resource tables,
+building-type tables, anything a developer wrote out by hand.
+
+The engine's resource table is 30 KB of `mov [rbp+disp], imm32`. Nothing in it is
+a symbol and nothing is a string, so techniques 1 and 2 cannot touch it and
+technique 3 only ever shows the finished bytes. But the code *is* the structure
+definition: disassemble the range, keep every store whose base register is the
+frame pointer, and replay them into a buffer.
+
+What made it exact, and what would break a naive version:
+
+- **Anchor the frame pointer to the structure.** `lea rbp,[rsp-0x290]` before
+  `sub rsp,0x390` makes `rbp == record + 0xC0`. Get that wrong by four bytes and
+  every field is misattributed, consistently, with no sign of trouble.
+- **Model the calls that clear part of the buffer.** One function in the middle of
+  each block zeroes the eighteen transport-class entries. Skip it and one
+  resource's values leak into the next.
+- **Track registers, not just immediates.** A name arrives as
+  `movabs rax, 0x7372656b726f77`; a float arrives as
+  `movss xmm0,[rip+...]`. A store of a register is worthless without the value
+  that got there.
+- **The buffer persists between instances.** That is a finding, not noise: it is
+  why every base-game record carries the tail of a previous, longer name after its
+  own terminator.
+- **Every commit idiom.** Records 0..34 commit with `add [rbx+8],0x340` and 35..56
+  with `call push_back`. Following only the first is what made an earlier note in
+  [02-findings.md](02-findings.md) say the table covered 35 of 57 records.
+
+Then **close the loop**: rebuild each instance from the field list you think you
+have and diff every byte against the replay. Anything the code writes that your
+list has no name for shows up immediately, and the count is a one-line regression
+test after a game update. `restable.py verify` is exactly that, and it is what
+turned "the record is mostly unknown" into a from-scratch resource.
 
 ## A note on linear disassembly
 

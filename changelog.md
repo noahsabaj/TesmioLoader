@@ -2,6 +2,14 @@
 
 ---
 
+*Update! - v. b0.3.6*
+The game's regular branch updated to v1.1.1.9 - the update notes said content only, but the executable itself had in fact reflowed throughout: `.text` grew in steps of up to nearly 500 bytes depending how far into it a given address sat, and the `.rdata` constant pool shifted in two separate clusters. Every hard-coded address across all nine active plugins has been re-derived and re-verified byte for byte against the new build; v1.1.1.7 is no longer supported, and none of its addresses remain in the source.
+The first launch on the new build crashed: `resources` was installing an import hook before its main hook, and when the main one refused (address moved), the loader freed the plugin with the import hook still pointing into it. Fixed - the import hook now installs only after the main one is confirmed.
+Two plugins, `aging` and `buildings`, are parked for now - `build.bat` skips both folders, so neither ships a DLL until they get a proper look. Nothing about either is deleted.
+Some stale comments describing an old, pre-plugin-split version of the loader (a resource-name hook that has lived in `plugins\resources` for a long time) were cleared out of `tesmioloader.cpp` - no behaviour changed, just what the file claims about itself.
+
+---
+
 *Update! - v. b0.3.5*
 Game version control. The launcher now reads the version out of SOVIET64.exe before it starts anything, says in its window which version is required and which one is installed, and refuses to launch a game that is not v1.1.1.7 - every address the loader patches belongs to that build, and injecting into another one is what makes the game die on startup with nothing to explain it. `version_check = 0` in tesmioloader.ini, or `--ignore-version`, turns the refusal back into a warning.
 The plugin list is now two columns with a scroll bar, so a long list no longer pushes the Launch button off the bottom of the screen. The launcher window carries the tesmioloader logo in its title bar.

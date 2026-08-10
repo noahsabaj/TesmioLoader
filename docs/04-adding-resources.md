@@ -27,23 +27,34 @@ what exists, `[resources]` is the wiring — the hook mode and the three RVAs. S
 
 The engine keeps its resources in one `std::vector` of 832-byte records, 57 of
 them, with room for 63. the plugin claims the slot after the last live
-record: it copies an existing record over the empty one, overwrites the name and
-the caption id, and moves the vector's `end` pointer forward by one. From that
-moment the game's own resolver finds the new resource by itself — nothing else
-has to be intercepted.
+record: it fills the empty one, overwrites the name and the caption id, and moves
+the vector's `end` pointer forward by one. From that moment the game's own
+resolver finds the new resource by itself — nothing else has to be intercepted.
+
+**There are two ways to fill it, and both are supported for good.**
+
+| | |
+|---|---|
+| `<name> = rawiron, Copper Ore` | **clone.** Copy a base-game record and correct it |
+| `<name> = custom, Hydrogen` | **from scratch.** A zeroed record, filled from `[custom:<name>]` |
+
+A clone is the short way to a resource that behaves like an existing one; from
+scratch is the way to one that behaves like nothing in the game. See
+[A resource with no template](#a-resource-with-no-template).
 
 Three things make it work in practice:
 
 **Cloning, not zeroing.** A freshly claimed record is all zeroes and the
 resource is inert. Copying a template gives it a transport class, densities and
-display data that the engine already knows how to handle.
+display data that the engine already knows how to handle — or, without a
+template, the plugin writes those 30 bytes itself.
 
 **Cloning, then correcting.** What a clone must *not* keep is the template's
 assets. The five mesh pointers in the record's tail are replaced with meshes
 loaded from this resource's own files, and the icon at `+0x48` is refilled by
 the engine's own by-name pass on the next world load. The template still decides
 the *shape* — whether there are four pile stages or one open-cargo mesh — which
-is read straight off the clone rather than declared anywhere.
+is read straight off the clone unless `cargo =` says otherwise.
 
 **Arming is retried, not done once.** The engine is still filling the vector
 while building types are being parsed. The loader watches for the slot to become
@@ -70,7 +81,7 @@ copper_concentrate = bauxite, Copper Ore Concentrate
 
 The plugin's own settings live in `[resources]`, further down the same file.
 
-`<name> = [<slot>,] <template>[, <caption>]`
+`<name> = [<slot>,] <template | custom>[, <caption>]`
 
 - **slot** — optional, and better left out. Omitted, the loader waits until
   every base-game record has landed and then claims the slots after them, in
@@ -84,11 +95,18 @@ The plugin's own settings live in `[resources]`, further down the same file.
   want `rawiron`, `rawcoal`, `rawbauxite`; processed ores want `bauxite`,
   `alumina`; liquids want `oil`, `alcohol`. Open cargo — anything that travels
   the way steel and boards do — wants `steel` or `aluminium`.
+
+  Or the word **`custom`** (`none` works too), which means there is no donor: the
+  record is built from zero out of `[custom:<name>]`. A leading field that is
+  neither a number nor a base-game resource name — a typo — is treated the same
+  way and says so in the log, because that is strictly better than what it used to
+  do, which was publish an all-zero record and one line about an unknown template.
 - **caption** — the display name. The loader mints a private localisation id
   from **1 000 000** up, writes it into the record, and answers
   `C3D_LANGUAGE::GetString` for that id itself. No language file is touched.
   Omit it and the template's caption is inherited — which is why an early
-  attempt showed "iron ore" everywhere.
+  attempt showed "iron ore" everywhere. On a `custom` entry there is nothing to
+  inherit, so an id is minted anyway and the resource is called by its own name.
 
   That base has to stay clear of every id the game uses, because the hook
   answers **everything** at or above it and never falls through. The game's
@@ -188,6 +206,133 @@ $STORAGE_EXPORT RESOURCE_TRANSPORT_GRAVEL 50.00
 ```
 
 The storage class must match the resource's own.
+
+## A resource with no template
+
+A clone is a good default and a bad ceiling: it can only ever produce a resource
+that behaves like one the game already has. **The whole record is now known**, so
+a resource can be declared outright — see
+[Record layout](02-findings.md#record-layout) for where every figure lives and
+how it was read.
+
+```ini
+[list]
+hydrogen = custom, Hydrogen
+
+[custom:hydrogen]
+transport  = oil
+kind       = 1
+price      = 180, 150
+market_rub = 400, 600
+market_usd = 500, 700
+family     = none
+cargo      = none
+```
+
+That is a gas that travels in a tanker, is worth something, produces no waste and
+has no cargo model. Nothing is cloned: every figure either comes from that section
+or from the plugin's own defaults.
+
+### What the section holds
+
+The one line that matters is **`transport`**. Without it nothing can carry the
+resource, and every storage that names it reports `0.00 of 0.00 t` — the same
+symptom a mismatched template gives, for the same reason.
+
+| Key | Record | Notes |
+|---|---|---|
+| `transport = <class>[, <factor>[, <f1>, <f2>[, <flag>]]]` | `+0xCC + class*0x20` | the primary class. Bare, its figures come from what the base game uses for that class |
+| `class = ...` | the same | a second, third… class, repeatable. `general` bare mirrors the primary — what ten of the twelve base-game two-class resources do |
+| `kind = 0` | `+0x44` | price kind: 0 raw, 1 manufactured, 2 food, 3 meat and components, 4 electronics |
+| `price = <rub>[, <usd>]` | `+0x58`/`+0x5C` | a starting value — the engine's pass overwrites it. `[price]` is what survives |
+| `base_price = <rub>[, <usd>]` | `+0x78`/`+0x7C` | likewise, against `[base_price]` |
+| `trade_mult = 0.95, 1.05` | `+0x88`/`+0x8C` and `+0xA8`/`+0xAC` | what the trade window multiplies the price by |
+| `market_rub = 200, 350[, 0.5]` | `+0x98`/`+0x9C`/`+0xA0` | the base game ranges 25/30 to 40000/60000 |
+| `market_usd = 500, 500[, 0.5]` | `+0xB8`/`+0xBC`/`+0xC0` | the second block |
+| `packed = auto` | `+0xC8` | `auto` is 1 for a primary class of covered, cooler, nuclear1 or nuclear2 |
+| `family = none` | `+0x30C` | `gravel`, `steel`, `aluminium`, `plastic`, `bio`, `food`, `burnable`, `toxic`, `other`, `ash`, a number, or `none` |
+| `cargo = auto` | the mesh slots | `none`, `bulk`, `open`, or `auto` — the files that are there |
+| `field = <off>, f\|i\|b, <v>` | anywhere | a raw write into the 832 bytes |
+
+**Every key is optional but `transport`.** The defaults are the base game's own
+commonest figures — the two market blocks twelve resources including every waste
+carry, a family of `-1` like `water` and `eletric`, and the `0.3` at `+0x310` that
+55 of 57 records have — so a section with one line in it produces a working
+resource.
+
+**`field =` is why the unidentified fields need no invented names.** `+0x50`,
+`+0x54` and `+0x310` are written by the base game and nothing here has found what
+reads them; `field = 0x50, f, 84` is what `waste_toxic` carries there, and the
+offsets are all in [02-findings.md](02-findings.md).
+
+### It also corrects a clone
+
+A `[custom:<name>]` section is read for *any* entry in `[list]`, and it is applied
+after the record has been zeroed **or** cloned. So one line over a clone changes
+one field and leaves the rest of the donor alone:
+
+```ini
+[list]
+copper_ore = rawiron, Copper Ore
+
+[custom:copper_ore]
+kind = 1
+```
+
+Which is the cheap way to fix the one thing a donor got wrong, instead of
+declaring a resource from nothing to change a single number.
+
+### Why it is safe to build from zero
+
+**A record is 832 bytes and only 30 of them are ever per-resource.** The rest is
+zero when the engine pushes its own records and filled at runtime: the icon at
+`+0x48` by the UI pass, the previous price and base by the economy passes, the
+five cargo meshes by the resource table. So a zeroed record plus those 30 bytes is
+not an approximation of a real record — it is one.
+
+That is checked rather than asserted. `tools/pe/restable.py verify` replays the
+engine's own table, rebuilds all 57 records **writing only the fields this plugin
+knows how to write**, and diffs every byte:
+
+```
+57 of 57 records rebuilt byte for byte - the field set is complete
+```
+
+If the engine wrote a field the plugin has no name for, that record would differ.
+Re-run it after a game update before trusting a from-scratch resource.
+
+### The two things a from-scratch record needs that a clone does not
+
+**A caption.** A clone inherits the template's id at `+0x40`; a zeroed record has
+0 there, which would resolve to whatever string id 0 is. So an id is minted for
+every `custom` entry whether `[list]` names a caption or not, and without one the
+resource is called by its own name.
+
+**An icon.** A clone inherits the template's texture pointer and is merely drawn
+wrongly without a `.png` of its own. A from-scratch record has **null** there
+until the UI pass at `0x2960DE` runs. That pass overwrites `+0x48` for every
+record without releasing what was there — `mov [rbx+0x48],rax` at `0x296172`, so
+the pointer is not owned by the record — which is what makes it safe for the
+plugin to seed the field from record 0 and leave a warning in the log. A 48×48
+RGBA PNG is not optional here.
+
+### The log is the whole diagnostic
+
+A `custom` entry always prints the record it produced, because there is no donor
+to compare it against:
+
+```
+resource  "hydrogen" published as index 66 (built from scratch, caption 1000009), vector now 67
+record    "hydrogen" kind 1  price 180.00/150.00  base 0.00/0.00  packed 0  family -1  +310 0.30
+record    "hydrogen" market rub  sell 0.95 buy 1.05  400 / 600  k 0.50
+record    "hydrogen" market usd  sell 0.95 buy 1.05  500 / 700  k 0.50
+record    "hydrogen" class oil       [ 3] factor 1.000  5.00 / 5.00  0.05 / 0.05  flag 0
+```
+
+`custom_report = 1` in `[resources]` adds the same block for the template-based
+entries, which is how to see what a clone really inherited. A record with no
+class at all says so in as many words, because that is the one mistake that makes
+a resource exist and be useless.
 
 ## What it costs
 
@@ -434,7 +579,9 @@ Symptoms and causes:
 | `slot N is taken (M live)` | wrong slot number in `[list]` |
 | `no room at index N` | `resource_capacity` is `-1`, or the reallocation failed — the line says which |
 | `cached record pointer(s) rebased` | the array moved later than it should have. Nothing is broken, but the ordering in `EnsureArmed` has changed and is worth checking |
-| storage shows `0.00 of 0.00 t` | transport class mismatch between storage and template |
+| storage shows `0.00 of 0.00 t` | transport class mismatch between storage and template — or, on a `custom` entry, no `transport =` line at all. The log says `can be carried by no transport class at all` |
+| `unknown field "..."` | a misspelt key in a `[custom:]` section. Nothing is guessed and nothing is silently skipped |
+| a `custom` resource prints no `record` lines | the entry never armed. Look for `published as index` first — the record block is printed straight after it |
 | price is `0.00` in the trade table | nothing produces the resource — the solver never reaches the base price. Force it in `[price]` |
 | `[base_price]` changes nothing | the resource is unproduced (see above), or `hook` is not 2, or `price_hook` is 0 |
 | caption is the template's | no caption given, or `GetString` hook failed to install |

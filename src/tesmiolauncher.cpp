@@ -40,12 +40,17 @@
 // because blocking them is the loader's business, not the window's.
 //
 // THE VERSION GATE. Every address the loader and its plugins patch belongs to
-// one build of the game, and the whole project is written against v1.1.1.7.
-// A patch site verifies its own bytes before it writes, so a game update makes
-// each hook refuse rather than corrupt the process - but that is a dozen
-// separate refusals in a log file nobody reads, after the game is already up.
-// The launcher checks the version once, before the process exists, and says so
-// in the window in plain words. A game that is not the supported version is not
+// a build of the game, and the project was originally written against v1.1.1.7.
+// A regular-branch content update then shipped v1.1.1.9 - a new PE build (its
+// own TimeDateStamp) but, per the update notes, no change to game code, only to
+// content - so tesmioloader b0.3.6 recognises both builds rather than dropping
+// the old one: kSupportedVersions below is a table, not a single constant, and
+// either build reads as GV_OK. A patch site still verifies its own bytes before
+// it writes, so if a future update ever does move code, the affected hooks
+// refuse rather than corrupt the process - but that is a dozen separate
+// refusals in a log file nobody reads, after the game is already up. The
+// launcher checks the version once, before the process exists, and says so in
+// the window in plain words. A game that is not a supported version is not
 // launched at all; `version_check = 0` in tesmioloader.ini, or --ignore-version,
 // turns the refusal back into a warning for whoever is porting to a new build.
 //
@@ -117,9 +122,15 @@
 #define MAX_PLUGINS     32                  // mirrors the loader's own cap
 #define WALK_UP_LEVELS  8
 
-// The one build of the game this project is written against. Every hard-coded
-// rva in the loader and in every plugin belongs to it, docs/02-findings.md
-// describes it, and nothing here has ever run against another one.
+// The build of the game this project is written against. Every hard-coded rva
+// in the loader and in every plugin belongs to it and was re-derived for it in
+// b0.3.6; docs/02-findings.md describes it.
+//
+// A table rather than one constant, because the port off v1.1.1.7 proved the
+// shape is worth keeping: adding a build is one row plus a pass of the address
+// scanner. v1.1.1.7 was dropped deliberately - its addresses no longer exist
+// anywhere in this tree, so accepting it would only inject into a game none of
+// the patches fit.
 //
 // Two independent facts about the same exe, and they answer different
 // questions. The four numbers are what the game prints in its own main menu and
@@ -131,12 +142,38 @@
 // preference - it is a statement about which addresses this binary was built
 // with, and a config key that let it be changed would only produce a launcher
 // that injects confidently into a game it cannot patch.
-#define GAME_VER_MAJOR  1
-#define GAME_VER_MINOR  1
-#define GAME_VER_PATCH  1
-#define GAME_VER_BUILD  7
-#define GAME_VER_TEXT   L"1.1.1.7"
-#define GAME_VER_STAMP  0x69C4098Cu         // 2026-03-25 16:13:00 UTC
+struct SupportedGameVersion
+{
+    int            v[4];
+    unsigned       stamp;
+    const wchar_t* text;
+};
+
+static const SupportedGameVersion kSupportedVersions[] = {
+    { { 1, 1, 1, 9 }, 0x6A3EB6ADu, L"1.1.1.9" },  // 2026-06-26 17:28:13 UTC
+};
+#define GAME_VER_COUNT (sizeof(kSupportedVersions) / sizeof(kSupportedVersions[0]))
+
+// The text every message that used to say "v" GAME_VER_TEXT now says instead -
+// built on first use from the table above so a third entry never needs a
+// second edit anywhere else in this file. "v1.1.1.7 or v1.1.1.9".
+static const wchar_t* SupportedVersionsText()
+{
+    static wchar_t text[64];
+    if (!text[0])
+    {
+        wchar_t* out = text;
+        size_t   left = _countof(text);
+        for (size_t i = 0; i < GAME_VER_COUNT && left > 2; i++)
+        {
+            int n = _snwprintf_s(out, left, _TRUNCATE, i == 0 ? L"v%s" : L" or v%s",
+                                 kSupportedVersions[i].text);
+            if (n < 0) break;
+            out += n; left -= (size_t)n;
+        }
+    }
+    return text;
+}
 
 // The ICON resource in src\tesmiolauncher.rc - logo.ico, generated from
 // logo.png, ten sizes. Windows takes the lowest-numbered ICON as the
@@ -643,18 +680,32 @@ static void ReadGameVersion(const wchar_t* exe, GameVersion* g)
 
     free(d);
 
-    // The verdict. The stamp is the stronger fact and settles both of the cases
-    // the numbers cannot: an exe whose numbers would not read is still this
-    // build if it is byte-for-byte the one the stamp names, and one that reads
-    // 1.1.1.7 out of a different binary is a rebuild rather than the build.
-    bool numbersMatch = g->known &&
-                        g->v[0] == GAME_VER_MAJOR && g->v[1] == GAME_VER_MINOR &&
-                        g->v[2] == GAME_VER_PATCH && g->v[3] == GAME_VER_BUILD;
-    bool stampMatch   = g->stamp == GAME_VER_STAMP;
+    // The verdict, checked against every entry in kSupportedVersions rather
+    // than one pair. The stamp is the stronger fact and settles both of the
+    // cases the numbers cannot: an exe whose numbers would not read is still a
+    // supported build if it is byte-for-byte one the stamp names, and one that
+    // reads e.g. 1.1.1.7 out of a different binary is a rebuild of that entry
+    // rather than the build.
+    int  byNumbers   = -1;      // index into kSupportedVersions matching g->v[], or -1
+    bool stampKnown  = false;   // g->stamp equals some entry's stamp
 
-    if (numbersMatch)   g->verdict = stampMatch ? GV_OK : GV_REBUILD;
-    else if (g->known)  g->verdict = GV_WRONG;
-    else                g->verdict = stampMatch ? GV_OK : GV_UNKNOWN;
+    for (size_t i = 0; i < GAME_VER_COUNT; i++)
+    {
+        const SupportedGameVersion* sv = &kSupportedVersions[i];
+        if (g->known && byNumbers < 0 &&
+            g->v[0] == sv->v[0] && g->v[1] == sv->v[1] &&
+            g->v[2] == sv->v[2] && g->v[3] == sv->v[3])
+            byNumbers = (int)i;
+        if (g->stamp == sv->stamp)
+            stampKnown = true;
+    }
+
+    if (byNumbers >= 0)
+        g->verdict = (g->stamp == kSupportedVersions[byNumbers].stamp) ? GV_OK : GV_REBUILD;
+    else if (g->known)
+        g->verdict = GV_WRONG;
+    else
+        g->verdict = stampKnown ? GV_OK : GV_UNKNOWN;
 }
 
 // One exe is asked about many times - at startup, when the path changes, and
@@ -698,10 +749,10 @@ static void VersionRequirementText(wchar_t* out, size_t n)
 {
     _snwprintf_s(out, n, _TRUNCATE,
                  g_versionCheck
-                     ? L"Requires Workers & Resources v" GAME_VER_TEXT
-                       L" (64 bit)"
-                     : L"Built for Workers & Resources v" GAME_VER_TEXT
-                       L" (64 bit) - the check is off, other versions may crash.");
+                     ? L"Requires Workers & Resources %s (64 bit)"
+                     : L"Built for Workers & Resources %s (64 bit) - the check "
+                       L"is off, other versions may crash.",
+                 SupportedVersionsText());
 }
 
 static void VersionStatusText(const GameVersion* g, wchar_t* out, size_t n)
@@ -1118,7 +1169,7 @@ static bool Inject(const wchar_t* gameFull, const wchar_t* dllFull)
 #define IDC_BROWSE  101
 #define IDC_HOST    102
 #define IDC_STATUS  103
-#define IDC_VERREQ  104             // "requires v1.1.1.7", always the same words
+#define IDC_VERREQ  104             // "requires v1.1.1.7 or v1.1.1.9", always the same words
 #define IDC_VERGOT  105             // what the exe on disk turned out to be
 #define IDC_LIST    106             // the scrolling viewport the checkboxes live in
 #define IDC_PLUGIN0 200
@@ -1456,17 +1507,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
                 wchar_t msg[768];
                 _snwprintf_s(msg, _countof(msg), _TRUNCATE,
-                    L"This game is %s, and tesmioloader is built for v"
-                    GAME_VER_TEXT L".\n\n"
-                    L"Every address it patches belongs to that one build. On any "
-                    L"other, the hooks either refuse - leaving a loader that does "
-                    L"nothing - or land in code that has moved, which crashes the "
-                    L"game with nothing in the log to explain it. So it is not "
+                    L"This game is %s, and tesmioloader is built for %s.\n\n"
+                    L"Every address it patches belongs to one of those builds. On "
+                    L"any other, the hooks either refuse - leaving a loader that "
+                    L"does nothing - or land in code that has moved, which crashes "
+                    L"the game with nothing in the log to explain it. So it is not "
                     L"started at all.\n\n"
-                    L"Install v" GAME_VER_TEXT L", or, if you are porting the "
+                    L"Install %s, or, if you are porting the "
                     L"addresses yourself: version_check = 0 in tesmioloader.ini, "
                     L"or run the launcher with --ignore-version.",
-                    what);
+                    what, SupportedVersionsText(), SupportedVersionsText());
 
                 MessageBoxW(hwnd, msg, L"tesmioloader - unsupported game version",
                             MB_ICONERROR | MB_OK);
@@ -1817,8 +1867,8 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
             Msg(L"  no --game: the ini's game_exe, then a walk up from here, then Steam");
             Msg(L"  --nogui:   skip the window, launch with whatever is in the ini");
             Msg(L"  --find:    say what the search resolved and exit, changing nothing");
-            Msg(L"  --ignore-version: inject into a game that is not v" GAME_VER_TEXT
-                L". It will probably not work");
+            Msg(L"  --ignore-version: inject into a game that is not %s"
+                L". It will probably not work", SupportedVersionsText());
             if (!g_console) MessageBoxW(NULL, g_log, L"tesmiolauncher", MB_OK);
             return 0;
         }
@@ -1902,7 +1952,9 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
         // Not "where" but "what", and the only line here that can veto the
         // rest: --find exits 2 when the game it found would not be launched.
         // GameVersionOf prints what it read; this says what was wanted.
-        Msg(L"needs  v" GAME_VER_TEXT L" (build %08X)", GAME_VER_STAMP);
+        for (size_t i = 0; i < GAME_VER_COUNT; i++)
+            Msg(L"needs  v%s (build %08X)", kSupportedVersions[i].text,
+                kSupportedVersions[i].stamp);
         if (found[0] && VersionRefuses(GameVersionOf(found))) return 2;
         return found[0] ? 0 : 1;
     }
@@ -1927,8 +1979,9 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     // here rather than inject into a build none of the addresses fit.
     if (VersionRefuses(GameVersionOf(found)))
     {
-        Msg(L"this game is not v" GAME_VER_TEXT L" - refusing to inject. "
-            L"version_check = 0 in %s, or --ignore-version, overrides this.", g_ini);
+        Msg(L"this game is not %s - refusing to inject. "
+            L"version_check = 0 in %s, or --ignore-version, overrides this.",
+            SupportedVersionsText(), g_ini);
         return 2;
     }
 

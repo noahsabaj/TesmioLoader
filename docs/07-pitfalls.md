@@ -952,3 +952,76 @@ Lessons:
   mod types the same open/close the vanilla types get, at the same two sites,
   emitted per declared deposit exactly like the terrain-mask bracket already
   was.
+
+## Slowing one clock in a game that keeps two
+
+`daynight` 1.x made a calendar day last thirteen times longer by giving back
+most of what the day tick had just added to `game+0x59C`. It works, in the sense
+that the date really does advance thirteen times slower. It logged cleanly, and
+the plugin's own probe agreed with it.
+
+What it did not do is slow anything else, and **this game counts in two
+different units.** Every rate is integrated per frame from
+`C3D_TIMER::PowerTime`; a long list of other things fires once per calendar day
+from the day tick and from nowhere else. Slowing only the second put the two a
+factor of thirteen apart, and the damage was in places nobody would think to
+look at after changing the sky:
+
+- **Pollution.** `0x4D5E80` subtracts a flat `0.06` and `0.005` from every cell
+  of the grid once per date. Emission is per frame. Thirteen times the emission
+  between two subtractions, so it never settles.
+- **Winter.** The same daily pass pins every home at full pollution exposure once
+  the grid runs away, and local heating — which is what runs in winter — is one
+  of the emitters. Citizens sicken and the population falls. The season
+  boundaries are days of the year, so each winter also lasts thirteen times
+  longer on the wall clock.
+- **Loans.** `0x4B93F0` decrements a term counted **in days** and pays
+  `outstanding / days-left`, once per date, out of an income that did not slow.
+- Used-vehicle offers, expiring notifications and the random-event roll: same
+  shape, same cause.
+
+None of these was found by reading the plugin. They were reported from a real
+game as three unrelated-sounding bugs — "extra pollution", "the population
+collapses in winter", "the loan starts over every day" — and only turned out to
+be one thing after `0x4D5E80` and `0x4B95C0` were traced back to the day tick.
+
+Lessons:
+
+- **Ask what unit a quantity advances in before scaling anything.** "Per second"
+  and "per day" are both spelled as a number in a config file, and the only way
+  to tell them apart is to find the code that increments them.
+- **A rate change is not local.** Scaling one clock in a simulation that has two
+  is a change to every ratio between them, and there is no list of those.
+- **Scale the whole clock or none of it.** The fix was to stop touching the
+  calendar and scale the simulation timer instead, which is what the game's own
+  speed buttons already do — `0x105A90` multiplies `timer[0]` by 0.35, 0.05 or
+  0.01. Riding the mechanism the game already has is what makes "everything
+  slows in step" true by construction rather than by an audit.
+- **Scaling three functions and not the fourth is the same bug again, smaller.**
+  The executable imports `Power`, `PowerTime` *and* `PowerKmh`; the last is
+  vehicle speeds. Swapping the time and leaving the traffic at full speed would
+  have been a fresh desynchronisation, so the plugin resolves all three slots
+  before patching any and puts back whatever it patched if one refuses.
+
+## A residue class is not a date
+
+The same plugin invents a day of the year congruent to the phase it wants
+modulo 13 and hands it to the weather machine. Version 1.x took *the next one at
+or after the real date*, which is up to twelve days ahead.
+
+That is fine while the only thing reading it is `% 13`. It is not fine because
+`0x333B30` also passes it to the snow-season test at `0x334340` and compares it
+against 284/326/328 for the overcast season. As the phase advances through one
+calendar day the invented date sweeps the whole thirteen-day window — and near a
+winter boundary that window straddles it, so the weather flips in and out of
+winter thirteen times a day.
+
+The fix is to keep the congruence and add a second condition: walk the
+representatives outward from the real date and take the first one the game's own
+`0x334340` puts in the same season. Every season in that function is at least a
+hundred days long and the representatives are thirteen apart, so one always
+exists.
+
+Lesson: **when you fake a value, enumerate every consumer of it, not just the
+one you are aiming at.** A field's meaning is the union of what reads it, and
+`% 13` was only the loudest reader.

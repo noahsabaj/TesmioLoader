@@ -1,14 +1,26 @@
 // tesmioloader - mod gate for Workers & Resources: Soviet Republic
 //
-// Phase A (done): code execution + a virtual file system over the game's data,
-//                 built entirely out of import-table swaps.
-// Phase B (here): an inline hook on the game's own resource-name resolver,
-//                 first to read out the real resource enum, then to hand back a
-//                 reserved slot index for names the base game has never heard of.
+// This file is the host, and only the host: code execution and a virtual file
+// system over the game's data, both built out of import-table swaps; the
+// generic IAT and inline-hooking primitives every plugin patches through; the
+// crash guard that keeps a bad offset in injected UI code from taking the game
+// down silently; and the plugin loader itself, which hands each DLL in
+// plugins\ a versioned table of the above (tesmio_api.h) and nothing more.
 //
-// The resolver was located by taking the one and only code reference to the
-// string "ResourceGet - not found %s" and reading the function bounds out of the
-// executable's exception table.
+// It used to be more than that. The very first version of this project hooked
+// the game's own resource-name resolver inline, right here, to read out the
+// real resource enum and hand back a reserved slot index for names the base
+// game had never heard of - the resolver found by taking the one code
+// reference to "ResourceGet - not found %s" and reading the function bounds
+// out of the exception table. That hook, the resource record layout behind it
+// and everything deposit-shaped moved out into plugins\resources and
+// plugins\deposits as the plugin architecture took shape (see
+// docs/09-plugins.md); nothing resource- or deposit-specific belongs here any
+// more, and none of the addresses below are resource or deposit ones. The
+// per-texel deposit-map probe further down (`probe_map`, `probe_texel`) looks
+// like an exception, but it is not a feature - it is a diagnostic that hooks
+// raw file and texture calls no plugin API exposes, kept here because only the
+// host sees those calls at all, and left off by default.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -1126,8 +1138,9 @@ static bool ReadablePtr(const void* p, size_t n)
 // ---------------------------------------------------------------- plugins
 //
 // Everything above this line is compiled into the loader because it is
-// infrastructure: the VFS, the resource registry, the deposit registry and the
-// three subsystems that registry drives. A *feature* does not have to be.
+// infrastructure: the VFS, the log, the hooking primitives, and the crash
+// guard. A *feature* does not have to be - resources, deposits and everything
+// built on them are plugins, not part of this file.
 //
 // A plugin is an ordinary DLL in `plugins\`. The loader finds it, checks it was
 // built against a compatible `tesmio_api.h`, and hands it a table of the things
@@ -1292,6 +1305,7 @@ static void BuildHostTable()
     g_host.engineModule = (void*)GetModuleHandleA(DLL_ENGINE);
     g_host.baseDir      = g_baseDir;
     g_host.pluginDir    = g_pluginDir;
+    g_host.vfsRoot      = g_vfsRoot;
 
     g_host.log               = Logf;
     g_host.findIatSlot       = api_FindIatSlot;
@@ -1850,7 +1864,7 @@ static void NoteSaveOpenW(const wchar_t* path, bool writing)
 //
 // The suffix is appended to the format string rather than printed separately,
 // so the game does the drawing and the line stays one string with one layout.
-#define P_MENU_VERSION_SITE 0x28B55C     // LEA RAX,[rip+disp32] - the format argument
+#define P_MENU_VERSION_SITE 0x28B5CC     // v1.1.1.9; was 0x28B55C. LEA RAX,[rip+disp32] - the format argument
 #define MENU_LEA_LEN        7
 
 static const BYTE kMenuLeaOrig[3] = { 0x48, 0x8D, 0x05 };   // lea rax,[rip+disp32]

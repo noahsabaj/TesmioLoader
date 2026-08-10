@@ -90,30 +90,31 @@
 // exactly two DLC maps and the other for everything else - which is why the
 // guard is neutralised rather than trusted.)
 //
-// Everything here is addresses for SOVIET64.exe v1.1.1.7, verified byte for
+// Everything here is addresses for SOVIET64.exe v1.1.1.9, verified byte for
 // byte before anything is written. See docs/12-walking.md.
 
 #include "../../src/tesmio_plugin.h"
 
 // ---------------------------------------------------------------- the sites
 
-// The walking limit in the batch builder at 0x12E1D0. An immediate, so there is
-// nothing to repoint: mov dword ptr [rsp+0x7C], 480.0f
-#define RVA_WALK_LIMIT   0x12E2DD
+// v1.1.1.9. The walking limit in the batch builder. An immediate, so there is
+// nothing to repoint: mov dword ptr [rsp+0x7C], 480.0f. Confirmed by the
+// opcode and the 480.0f operand together, not by the offset alone; was 0x12E2DD.
+#define RVA_WALK_LIMIT   0x12E2CD
 static const BYTE kWalkLimitOp[] = { 0xC7, 0x44, 0x24, 0x7C };
 #define VANILLA_WALK     480.0f
 
 // Everything else is `movss xmm0,[rip+disp32]`, and only the displacement is
 // rewritten - and only after the address it resolves to and the value in there
-// both check out.
-#define RVA_WALK_CONST   0x90AF38   // 480, as the queued builder and the overlay read it
-#define RVA_CAR_CONST    0x90B11C
+// both check out. .rdata moved by a uniform -0x18 in this build.
+#define RVA_WALK_CONST   0x90AF20   // 480, as the queued builder and the overlay read it - was 0x90AF38
+#define RVA_CAR_CONST    0x90B104   // was 0x90B11C
 #define VANILLA_CAR      2500.0f
 
-#define RVA_WALK_RADIUS  0x90AF70
+#define RVA_WALK_RADIUS  0x90AF58   // was 0x90AF70
 #define VANILLA_WALK_R   530.0f
 
-#define RVA_CAR_RADIUS   0x90B120
+#define RVA_CAR_RADIUS   0x90B108   // was 0x90B120
 #define VANILLA_CAR_R    2600.0f
 
 // The four values, and the slot each site points at.
@@ -134,19 +135,24 @@ struct Site
 // Every place the game spells one of these distances out, other than the batch
 // builder's immediate. The overlay pair is why the button drew nothing new:
 // the highlight does not read the connections, it runs the search again.
+// v1.1.1.9 rvas; each one re-found by its opcode still resolving to the right
+// .rdata constant (see docs/02-findings.md). Old rvas, in the same order:
+// 0x12E7AF, 0x43F04A, 0x43F835, 0x12F926, 0x43FFB3, 0x12DEA7, 0x12F502.
 static const Site kSites[] = {
-    { 0x12E7AF, RVA_WALK_CONST,  VANILLA_WALK,   SLOT_WALK,   "walk build queued" },
-    { 0x43F04A, RVA_WALK_CONST,  VANILLA_WALK,   SLOT_WALK,   "walk overlay"      },
-    { 0x43F835, RVA_WALK_CONST,  VANILLA_WALK,   SLOT_WALK,   "walk overlay 2"    },
-    { 0x12F926, RVA_CAR_CONST,   VANILLA_CAR,    SLOT_CAR,    "car build"         },
-    { 0x43FFB3, RVA_CAR_CONST,   VANILLA_CAR,    SLOT_CAR,    "car overlay"       },
-    { 0x12DEA7, RVA_WALK_RADIUS, VANILLA_WALK_R, SLOT_WALK_R, "walk rebuild"      },
-    { 0x12F502, RVA_CAR_RADIUS,  VANILLA_CAR_R,  SLOT_CAR_R,  "car rebuild"       },
+    { 0x12E79F, RVA_WALK_CONST,  VANILLA_WALK,   SLOT_WALK,   "walk build queued" },
+    { 0x43F0EA, RVA_WALK_CONST,  VANILLA_WALK,   SLOT_WALK,   "walk overlay"      },
+    { 0x43F8D5, RVA_WALK_CONST,  VANILLA_WALK,   SLOT_WALK,   "walk overlay 2"    },
+    { 0x12F916, RVA_CAR_CONST,   VANILLA_CAR,    SLOT_CAR,    "car build"         },
+    { 0x440053, RVA_CAR_CONST,   VANILLA_CAR,    SLOT_CAR,    "car overlay"       },
+    { 0x12DE97, RVA_WALK_RADIUS, VANILLA_WALK_R, SLOT_WALK_R, "walk rebuild"      },
+    { 0x12F4F2, RVA_CAR_RADIUS,  VANILLA_CAR_R,  SLOT_CAR_R,  "car rebuild"       },
 };
 
-// The save loader's "this save predates the longer distances" test.
-#define RVA_REGEN_CMP    0x438366   // 83 3D <disp32> 6E   cmp dword[ver],110
-#define RVA_REGEN_TEST   0x438373   // 84 C0 0F 85 ...     test al,al / jnz
+// The save loader's "this save predates the longer distances" test. v1.1.1.9;
+// was 0x438366/0x438373 - same shape, cmp+jge then a separate test al,al/jne,
+// both landing on the same target, confirmed by disassembly.
+#define RVA_REGEN_CMP    0x438406   // 83 3D <disp32> 6E   cmp dword[ver],110
+#define RVA_REGEN_TEST   0x438413   // 84 C0 0F 85 ...     test al,al / jnz
 #define RVA_SAVE_VERSION 0x9E9C3C
 
 static const BYTE kMovssRip[]  = { 0xF3, 0x0F, 0x10, 0x05 };

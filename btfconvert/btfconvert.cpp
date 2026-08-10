@@ -1123,7 +1123,7 @@ static int ShowUi()
                   ES_AUTOVSCROLL,
                   pad + 8, logY + 18, W - 2 * pad - 16, logH - 26, IDC_LOG, g_mono);
 
-    Log(L"btfconvert - .btf <-> .txt, no Python needed");
+    Log(L"btfconvert - .btf <-> .txt");
     Log(L"language files are media_soviet\\soviet<Language>.btf");
     Log(L"a rebuilt file ships as tesmioloader\\vfs\\media_soviet\\<name>.btf");
     Log(L"- no game file is touched");

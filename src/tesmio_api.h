@@ -49,7 +49,7 @@
 // Bumped whenever anything below changes at all - a new field, a new service, a
 // new constant. It is what a plugin reports back through TsmPluginApiVersion,
 // and it is how the host knows what that plugin was built to expect.
-#define TSM_API_VERSION 3u
+#define TSM_API_VERSION 4u
 
 // The oldest plugin this host still initialises, and the whole of the
 // compatibility promise: the host accepts anything in
@@ -207,6 +207,22 @@ typedef struct TsmHost
     // choice. Provide from Init, consume from Start.
     int         (*provide)(const char* service, unsigned version, const void* iface);
     const void* (*consume)(const char* service, unsigned version);
+
+    // ---- v4 (appended; check structSize before reading on a plugin built
+    //          against v3 or older) ----
+    //
+    // The folder file reads are redirected against - NOT necessarily
+    // `baseDir\vfs`. ResolveVfsRoot in tesmioloader.cpp prefers a `vfs` folder
+    // one level up from baseDir (the source tree's tesmioloader\vfs, when
+    // build\ sits inside it) and only falls back to baseDir\vfs when no such
+    // sibling exists. A plugin that writes a new file *into* the VFS - not
+    // just reads through it - must use this rather than reconstruct
+    // `baseDir + "\vfs"` by hand: the two disagree whenever the sibling
+    // exists, which is every normal checkout, and CreateDirectoryA is not
+    // recursive, so writing to the wrong guess fails outright rather than
+    // landing somewhere merely unread. plugins/deposits' blank extra-map
+    // texture is what exposed this.
+    const char* vfsRoot;
 
 } TsmHost;
 

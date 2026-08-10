@@ -1,8 +1,25 @@
 # Findings — game internals
 
-Everything here is for **SOVIET64.exe v1.1.1.7, 64-bit DX11.1**, PE timestamp
-2026-03-25 16:13 UTC, 10 308 096 bytes. Addresses are **RVAs**; add the runtime
-module base. ASLR is on, so nothing may be hard-coded as an absolute address.
+Everything here was written against **SOVIET64.exe v1.1.1.7, 64-bit DX11.1**,
+PE timestamp 2026-03-25 16:13 UTC, 10 308 096 bytes, and the RVAs quoted
+through this document are still that build's. Addresses are **RVAs**; add the
+runtime module base. ASLR is on, so nothing may be hard-coded as an absolute
+address.
+
+**The project itself has since moved to v1.1.1.9** (regular-branch update,
+2026-08-11, PE timestamp `0x6A3EB6AD`) — every plugin's `#define`d rva is the
+v1.1.1.9 one, re-derived and re-verified byte for byte; v1.1.1.7's addresses
+are not carried anywhere in the source any more. This document was not
+rewritten wholesale for the new build - that would mean re-deriving every RVA
+narrated below by hand with no functional benefit, since the plugins
+themselves are the ones a hook actually checks against. Treat an address
+quoted here as **v1.1.1.7 provenance for how a finding was made**, not as
+what is compiled in today; for the current address, read the `#define` in the
+relevant plugin, which carries its v1.1.1.9 value and an "was 0x..." comment
+back to the one this page still shows. `docs/01-architecture.md`, *Porting
+off v1.1.1.7*, has what actually changed between the two builds - which
+sections shifted, by how much, and the one plugin bug the port's single crash
+turned out to be.
 
 Where something is inferred rather than observed, it says so.
 
@@ -69,25 +86,141 @@ does, in `RebaseResourceCache`.
 
 ### Record layout
 
+**Complete, and none of it guessed.** The resource table below builds each record
+in one stack buffer whose `rbp` is `record + 0xC0`, so replaying every write
+through `rbp` gives the exact contents of all 57 base-game records with the game
+not running. `tools/pe/restable.py` is that replay; `restable.py verify` rebuilds
+every record from the field list here and diffs all 832 bytes, and **57 of 57
+come out byte for byte identical** — which is the check that says nothing is
+missing rather than merely unnoticed.
+
+**Only 30 bytes of the 832 are ever written per resource.** Everything else is
+zero when the record is pushed and filled later at runtime.
+
 | Offset | Meaning |
 |---|---|
 | `+0x00` | name, inline, NUL-terminated, up to 32 bytes |
 | `+0x40` | localisation id of the display caption |
 | `+0x44` | price kind — see [Money](#money) |
 | `+0x48` | the resource's icon texture, `media_soviet/resources/<name>.png` |
+| `+0x50` / `+0x54` | set on nine records only. Unidentified — see below |
 | `+0x58` / `+0x5C` | **price**, RUB and USD |
 | `+0x70` / `+0x74` | the previous price, mirrored by the pass for `eletric` only |
 | `+0x78` / `+0x7C` | **base price**, RUB and USD — `$Economy_Base*` |
 | `+0x80` / `+0x84` | the previous base, mirrored by the drift pass |
-| `+0x88` / `+0x8C` | sell and buy multipliers, `0.95` and `1.05` on every resource |
+| `+0x88` … `+0xA7` | market block one, below. `+0x88`/`+0x8C` are the sell and buy multipliers |
+| `+0xA8` … `+0xC7` | market block two, the same shape |
+| `+0xC8` | one byte, the packed flag, below |
+| `+0xCC` … `+0x30B` | **eighteen transport-class blocks**, `0x20` bytes each, below |
+| `+0x30C` | material family, below |
+| `+0x310` | `1.0` on `workers` and `eletric`, `0.3` on the other 55. Unidentified |
+| `+0x318` … `+0x338` | the five cargo meshes — see [The mesh slots](#the-mesh-slots) |
 
 `+0x48` is what the minimap button row binds, so any UI that wants a resource's
-icon can take it straight from the record instead of loading its own asset.
+icon can take it straight from the record instead of loading its own asset. The
+UI pass at `0x2960DE` **overwrites it for every record without releasing what was
+there** (`mov [rbx+0x48],rax` at `0x296172`), so the pointer is not owned by the
+record and two records may safely share one.
 
-Found by diffing full records of `workers`, `coal`, `rawiron` and `alcohol`:
-`+0x40` was the only field that differed between them and stayed stable across
-runs — 518, 508, 524, 512 respectively. The rest of the 832 bytes is not
-mapped; cloning an existing record is how a new one is made viable.
+#### The eighteen transport classes
+
+`+0xCC`, stride `0x20`, one per `RESOURCE_TRANSPORT_*` in
+`media_soviet/scripts/SOVIETInstructions.txt` — `COVERED` 0 to `WASTE` 17, with
+`RESOURCE_TRANSPORT_NUM` 18. The count is not inferred from the enum: the table's
+prologue zeroes the array with `mov ecx,0x12`, and `0x2A1B80` — which every
+resource block calls before writing its own classes — clears exactly eighteen
+blocks. A resource declares one class, sometimes two, and the rest stay zero.
+
+| Offset in block | Meaning |
+|---|---|
+| `+0x00` | **capacity factor**. The `building.ini` parser multiplies a `$STORAGE` capacity by it — `mulss xmm0,[rax+rbx+0xCC]` at `0x117B91` — which is why a storage whose class differs from the resource's own reports `0.00 of 0.00 t` |
+| `+0x04`, `+0x08` | two figures set per *class* rather than per resource: `GRAVEL` `0.5`/`30` on nine of thirteen users, `OPEN` `1.25`/`2.5`, `OIL` and `WATER` `5`/`5`, `CONCRETE` `5`/`20`, `ELETRIC` and `HEATING` `1`/`1`. Unidentified |
+| `+0x0C`, `+0x10` | `0.05` on exactly the three classes that move a liquid through a pipe — `OIL`, `WATER`, `SEWAGE` — and zero on the other fifteen |
+| `+0x1C` | a byte. Set only ever on a *second* class: `cement`/`alumina`/`meat` on `GENERAL`, `livestock` on `COVERED` and `GENERAL`. The customhouse sync reads it as "not tradeable in this class", which is the one behaviour that depends on it |
+
+`GENERAL` is the container class, and ten of the twelve resources that declare it
+give it **the same three figures as their primary class**; `cement`, `alumina` and
+`meat` give it lower ones and set the flag.
+
+#### The two market blocks
+
+`+0x88` and `+0xA8`, byte-identical in shape:
+
+| Offset in block | Meaning |
+|---|---|
+| `+0x00` | sell multiplier, `0.95` |
+| `+0x04` | buy multiplier, `1.05` |
+| `+0x10`, `+0x14` | two large figures — `eletric` 40000/60000, `coal` 9500/9500, `iron` 6500/7500, `waste_toxic` 25/30, and 200/350 in the first block with 500/500 in the second on twelve resources including every waste |
+| `+0x18` | `0.5`, or `0.65` on coal, `0.75` on chemicals and bitumen, `0.85` on the liquids |
+| `+0x1C` | `1.0` — **the only field of the whole record that is the same in all 57** |
+
+`+0x88`/`+0x8C` is the pair [Money](#money) identifies: the trade window quotes
+the price times `+0x8C` to buy and times `+0x88` to sell. The second block carries
+the same two multipliers and a different pair of large figures, so **which block
+is which currency is not established** — pairing them with the price pair at
+`+0x58`/`+0x5C` by position is the whole of the argument. `workers`, `vehicles`
+and `trains` are the three untradeable resources and they are exactly the three
+whose blocks are entirely zero but for `+0xA4`/`+0xC4`.
+
+#### The packed flag
+
+`+0xC8`, one byte, and its distribution is exact: 1 on `plants`, `chemicals`,
+`uf6`, `nuclearfuel`, `nuclearfuelburned`, `fabric`, `alcohol`, `food`, `clothes`,
+`meat`, `ecomponents`, `mcomponents`, `plastics`, `eletronics` and `explosives`,
+0 on the other 42.
+
+**Those fifteen are precisely the resources whose primary transport class is
+`COVERED`, `COOLER`, `NUCLEAR1` or `NUCLEAR2`** — and they are also the fifteen
+with no cargo geometry at all under `media_soviet/resources`, the goods a lorry
+carries as a crate or a container. The rule reproduces all 57 records with no
+exception, which is what lets `resources` derive the byte from the class. What
+reads it is not established.
+
+#### The material family
+
+`+0x30C`, an int: `-1` on `workers`, `eletric`, `heat`, `water` and `usagewater` —
+the five with no material form — and 10 to 19 on the other 52. **Each of the ten
+values holds exactly one waste resource:**
+
+| Value | Waste | With |
+|---|---|---|
+| 10 | `waste_gravel` | gravel, rawgravel, prefabpanels, bricks, cement, asphalt, concrete |
+| 11 | `waste_steel` | steel, iron, rawiron, mcomponents |
+| 12 | `waste_aluminium` | aluminium, bauxite, rawbauxite, alumina |
+| 13 | `waste_plastic` | ecomponents, plastics, eletronics |
+| 14 | `waste_bio` | plants, fertiliser_liquid |
+| 15 | `fertiliser` | food, meat, livestock |
+| 16 | `waste_burnable` | wood, boards |
+| 17 | `waste_toxic` | oil, chemicals, bitumen, the whole nuclear chain, fuel, alcohol, explosives |
+| 18 | `waste_other` | vehicles, trains, fabric, clothes |
+| 19 | `waste_ash` | coal, rawcoal |
+
+So it is a material family and the sorted-waste mapping is the obvious thing it
+would be for, but what reads it is not established. `-1` is a value five base
+records carry, which makes it the safe default.
+
+#### `+0x50` and `+0x54`
+
+Two floats, non-zero on nine records: `nuclearfuelburned` 127, `waste_toxic` 84,
+`usagewater` 1, `waste_burnable` 0.3, `waste_other` 0.7, `waste_ash` 0.6 at
+`+0x50`; `waste_gravel` 0.002, `waste_steel` 0.2, `waste_aluminium` 0.15,
+`waste_plastic` 0.03 and the four landfill wastes 1.0 at `+0x54`. Nothing here has
+found what reads them, and a byte-scan for the displacement is useless — 0x50 is
+one of the commonest displacements in the executable. They default to zero, which
+is what 48 of 57 records carry.
+
+#### The name field is not zero-padded
+
+A record the engine pushes carries **garbage after the name's terminator**,
+because every record is built in the same stack buffer and each block writes only
+as many name bytes as its name needs. `nuclearfuelburned` is 17 characters and
+leaves a `d` at `+0x10` of every record built after it. Nothing reads past the
+NUL — the resolver is `strcmp` — but a byte-for-byte comparison has to know.
+
+The earlier note here said `+0x40` was found by diffing four live records and
+that the rest of the 832 bytes was unmapped, which is why cloning was the only
+way to make a new record viable. Reading the table instead settled the whole
+layout, and `resources` can now build a record with no template at all.
 
 ### The resource table
 
@@ -97,15 +230,35 @@ Its prologue is `lea rbp,[rsp-0x290]` before `sub rsp,0x390`, so **`rbp` is
 `record + 0xC0`** and every constant in it reads off directly:
 `mov [rbp-0x80], 0x207` is caption id 519.
 
-**It only covers the first 35 records** — `workers` through `clothes`. There are
-exactly 35 pushes in the whole executable at that stride and the last one is at
-`0x2A618A`; the remaining 22 records are built somewhere that does not use the
-same idiom. Their constants are still in the same code range and still written
-through `rbp`, which is how `explosives` at `0x2A6D0B` and `water` at `0x2A6E52`
-were read.
+**It covers all 57**, in one function, and the note here that said it covered
+only the first 35 was reading one of two commit idioms. Records 0..34 —
+`workers` through `clothes` — are committed inline with
+`add qword ptr [rbx+8],0x340`, 35 of them, the last at `0x2A618A`. Records
+35..56 are committed with `call 0x449350(vector, record)`, an out-of-line
+`push_back`, out of the same stack buffer and through the same `rbp`. Following
+both idioms yields exactly 57 records in the documented index order.
+
+Two things make the replay exact:
+
+- **`0x2A1B80(record)`** is called at the top of every resource's block and
+  clears the eighteen transport-class entries — `[+0x00,+0x14)` and the flag at
+  `+0x1C` of each. Without modelling it, one resource's classes leak into the
+  next, because the buffer is zeroed once for the whole function and never again.
+- The buffer **persists between records**, which is why a record carries the tail
+  of a previous, longer name after its own terminator.
+
+`tools/pe/restable.py` is that replay, and `restable.py verify` is the check that
+the field list in [Record layout](#record-layout) is complete.
 
 Everything the table writes is a *starting* value. The price pass below
 overwrites `+0x58`/`+0x5C` for all but one kind before the first frame.
+
+**Every float constant in the executable may be one ULP low.** The compiler that
+built the base game truncated a decimal literal towards zero where a modern one
+rounds to nearest: `0.05` is `0x3D4CCCCC` in the executable and `0.05f` compiles
+to `0x3D4CCCCD` today, and `0.6` is `0x3F199999` against `0x3F19999A`. It changes
+nothing any of these fields do, but a byte-for-byte comparison has to spell the
+constants exactly — `RES_LIQUID_F` in `plugins/resources/resources.cpp` is that.
 
 ### Money
 
@@ -125,7 +278,12 @@ engine's own names for them are visible.
 | `-5` | `heat` — pinned to `1.0` in both currencies |
 | `0` | raw: everything mined, pumped, grown or scrapped |
 | `1` | manufactured |
-| `2` | `food` and `clothes` |
+| `2` | `food`, `clothes`, `livestock` |
+| `3` | `meat`, `asphalt`, `concrete`, `ecomponents`, `mcomponents`, `plastics` |
+| `4` | `eletronics` |
+
+Ten distinct values over the 57 records. The pass only branches on `-1` and `-5`;
+what tells `0` from `4` apart is inside the solver at `0x2A9470`.
 
 **`+0x58`/`+0x5C` is the price.** The trade window's buy figure is this times
 `+0x8C` (`1.05`) and its sell figure this times `+0x88` (`0.95`) — one number
@@ -776,7 +934,9 @@ randomises every status float in one run. Live people are a global array of
 | Offset | Contents |
 |---|---|
 | `+0x20` | the building the person is in |
-| `+0x70` | age; `0x8368B0` turns it into the eight-step factor every demand is scaled by |
+| `+0x70` | a state timer, **not the age** — see below. `0x8368B0` turns it into the eight-step factor every demand is scaled by |
+| `+0xA4` | `C3DRandom_Float(0.9, 1.1)` at birth, never changed: the person's own speed multiplier |
+| `+0x65C` | the walk animation's phase, **not the age** — see below |
 | `+0xC8` | non-zero suppresses every service demand — a foreign worker or a tourist |
 | `+0xD8` | **eleven status floats**, in exactly the order the script VM lists them: happiness, food, health, soviet, alcohol, culture, sport, religion, clothing, electronic, crime |
 | `+0x110` | demand count |
@@ -788,6 +948,35 @@ randomises every status float in one run. Live people are a global array of
 One demand, `0x80` bytes: `+0x00` amount still wanted, `+0x04` amount in total,
 `+0x08` kind (`0xF` while being built, **1 and 2 are the two a shop serves**),
 `+0x10` the `Resource*`, then two `0x34`-byte targets at `+0x18` and `+0x4C`.
+
+### Where the age is not
+
+`+0x70` was written down here as the age and is not. The per-person tick at
+`0x832CB0` **zeroes it** at `0x8337C0` and `0x8338F9` and accumulates the frame
+time into it in between, which no age does. What reads it, `0x8368B0`, only
+turns it into an eight-step factor through the thresholds 30, 60, 90, 120, 150,
+180 and 210 — and those are not human ages either.
+
+`+0x65C` is the more convincing near-miss. It grows as
+`dt · person[0xA4] · 30.0 · k` with `k` 5 at `0x832E45` and `0x833CC0`, 2 at
+`0x832E65` and 1 otherwise, which reads exactly like a life running faster under
+strain. It is the **walk animation**: it wraps back to zero the moment it passes
+`record[0x9C] − 1`, it is seeded at birth with
+`C3DRandom_Float(0, record[0x9C] · 0.5)` at `0x822DBA` so nobody moves in
+lockstep, and `record` is a `0xB0`-byte entry reached through the object at
+`person+0x668`. A quantity that loops over a per-object frame count, at 30 a
+second, five times faster while moving, is a frame counter.
+
+**The age itself is still unlocated.** The script API declares
+`Person.fAge` and `Person_SetAge` (instruction 31004), but neither the names nor
+the id appear anywhere in the executable — that file is documentation, not data
+— so there is no string to cross-reference. The constructor at `0x823290` never
+writes an age, and every `dt ·` in the per-frame tick lands in `+0x10`, `+0x28`,
+`+0x48`, `+0x70`, `+0x90`, `+0x65C` or `+0x680`. It is advanced somewhere else.
+
+`plugins/aging` is the probe that settles it: it snapshots whole `Person`
+objects and diffs them across calendar days, which answers *which offset* and
+*how fast* in the same run. See the header of `plugins/aging/aging.cpp`.
 
 The capacity is arithmetic rather than a declared bound: `(0x4F0 - 0x118) /
 0x80 == 7`, and an eighth entry would run over the unsatisfied count. Nothing
@@ -855,6 +1044,69 @@ demand's two `0x34`-byte targets at `+0x18` and `+0x4C` open with a place-kind �
 1 for food and meat, 9 for clothes and electronics, `0xE` for none — and whether
 a building answers a place-kind by what it stocks or by what it is decides
 whether a shop stocking only a modded good is ever visited.
+
+### Why happiness and health moved — the game's own ledger
+
+The statistics window itemises every reason happiness or health changed, and the
+two arrays behind it are the **complete enumeration of what a citizen's needs
+can affect**. Both drawers walk a float array immediately followed by an int
+array of the same length, with a base language id incremented once per entry:
+
+| Ledger | Drawer | Entries | Floats | Counts |
+|---|---|---|---|---|
+| happiness | `0x8D490` | 23, ids 54031…54053 | `0x9E5970` | `0x9E59CC` |
+| health | `0x8C3C0` | 12, ids 54003…54014 | `0x9E58B0` | `0x9E58E0` |
+
+`0x8DB95` is `mov r12d,0xD30F` — 54031, the base id — and `0x8DBA2` is
+`lea r13d,[r15+0x17]`, the count. Scanning `.text` for `inc dword ptr [rip+X]`
+landing in either count array then maps every reason to the code that raises it,
+which is far cheaper than reading any of those functions.
+
+The demand-carried nine all land in one function, **`0x83A4F0(game, person)`**,
+called once from `0x8338E0` in the per-person tick `0x832CB0` right after the
+planner. It picks the reason from two fields of the demand and nothing else:
+`demand+0x08` is 3 alcohol, 4 church, 5 culture, 6 sport, 10 hospital; kinds 1
+and 2 compare `demand+0x10` against the four cached records at `game+0xC300`,
+`+0xC310`, `+0xC318`, `+0xC320` — food, meat, clothes, electronics.
+
+The rest that matter come from the building side: `0x1BC1A0` (the living tick:
+*No electricity*, *No water*), `0x488AE0` (interior temperature, both ledgers),
+`0x1B08E0` (drinking-water health), `0x256010`/`0x257170` (crime), `0x4C2150`
+(broadcast, a bonus only). Every one computes its per-person amount **once
+before the loop over inhabitants**, scales it by the "Unsatisfied citizens
+reaction" setting at `game+0x5C8` (×0.8 / ×1.0 / ×1.2), and guards the ledger
+write with `ucomiss amount,0 / je` — so a zeroed amount is invisible to the
+statistics as well as to the citizen. See [16-easystart.md](16-easystart.md).
+
+Two negatives worth writing down: **there is no "no sewage" reason** (a full
+sewage store stops the building drawing water, and the player sees *No water*),
+and **reason 4, "Job", has no writer at all** in this build.
+
+### The world's own settings block
+
+`0x42CBD0`, the world saver, copies them into the header in one run at
+`0x42CE67`…`0x42CF60`, which is what identifies them as a block:
+
+| Offset | What |
+|---|---|
+| `game+0x590` | day of the year |
+| `game+0x594` | the year, absolute — 1970 in a fresh save, `$DATE_YEAR` in `stats.ini` |
+| `game+0x59C` | time into the day, `0..60` |
+| `game+0x5BC` | **Education simulation**, `> 0` = Complex |
+| `game+0x5C8` | **Unsatisfied citizens reaction**, 0 small / 1 reasonable / 2 great |
+
+plus `+0x578`, `+0x5B0`, `+0x5B4`, `+0x5C0`, `+0x5C4`, `+0x5CC`, `+0x5D0`,
+`+0x5D4`, `+0x5D8`, `+0x5DC`, `+0x5E0`, unidentified.
+
+`game+0x5BC` is the single switch behind both *"children must be taught in
+schools"* and *"parents of children under six can work only if they can place
+them in a kindergarten"* — language ids 713 and 714 — and it also gates the
+education requirement on jobs. It is read from a dozen simulation sites
+(`0x1A9CF0`, `0x1A9D60`, `0x1A9DD0`, `0x1AA03F`, `0x1A772A`, `0x1AD827`,
+`0x3BB29A`, `0x831A23`, `0x822FDE`, `0x823129`, `0x825FD4`, `0x8260C6`) and
+separately from the interface (`0x76A7B0`, `0x775180`, `0x7A4870`, `0x76B2F0`),
+which is what makes it possible to relax the simulation without taking the
+buildings out of the build menu.
 
 ## Walking and parking connections
 
@@ -1006,6 +1258,138 @@ colour is not in the shader at all — it is the `C3D_PANEL2D` vertex tint at
 Compiled shader blobs read out with `D3DDisassemble` from
 `d3dcompiler_47.dll` via ctypes; the `.inix` files are a name followed by its
 vertex and pixel `DXBC` blobs, whose lengths are at blob `+0x18`.
+
+## The two clocks, and everything counted in calendar days
+
+The distinction that broke `daynight` 1.x and is worth knowing before touching
+any rate in this game: **there are two ways a quantity advances, and they are
+not interchangeable.**
+
+### The simulation clock
+
+One `C3D_TIMER`, at rva `0x9D4EE0`, inline in `.data`. 337 sites reference it.
+Everything per-frame is integrated from it through three imported methods:
+
+| Import slot | Symbol |
+|---|---|
+| `0x86C028` | `?PowerTime@C3D_TIMER@@QEAAMM_N0@Z` |
+| `0x86C030` | `?Power@C3D_TIMER@@QEAAMM_N0@Z` |
+| `0x86D5C0` | `?PowerKmh@C3D_TIMER@@QEAAMM_N0@Z` — vehicle speeds |
+
+All three are the same four instructions (C3DDLL64 rva `0xFD620`, `0xFD670`,
+`0xFD6B0`):
+
+```c
+if (this[0xC] && !ignorePause) return 0;      // paused
+if (this[0xD] && !realTime)    return 0;      // blocked
+return v * K / (realTime ? this[4] : this[0]);
+```
+
+`this[0]` is the frame rate **game** time is divided by, `this[4]` the real one.
+A caller passing `realTime = true` is asking for wall-clock time deliberately.
+`PowerMs` is exported but not imported by the game.
+
+**The game speed is a multiplication of `this[0]`, nothing more.** `0x105A90`
+calls `C3D_TIMER::Start` on the timer once per frame and then:
+
+| Multiplier | RVA of the constant | Meaning |
+|---|---|---|
+| 0.35 | `0x909D7C` | normal |
+| 0.05 | `0x909C2C` | fast |
+| 0.01 | `0x909BA8` | fastest |
+| 3 / 5 / 1000 | `0x90A45C` / `0x90A6C0` / `0x90B094` | the slow modes |
+
+`0x9D54B4` is the run state — `0` sets `timer[0xC]`, the pause flag PowerTime
+reads. So **scaling that field, or the three `Power*` on that timer, is exactly
+one more speed step**, and the engine already ships a mode dividing the step by
+a thousand.
+
+`MultiplyFPS` (`0x86CF18`) is *not* the speed control: its only two callers are
+in `0x139A80` and they bracket part of the update with a temporary 3× step when
+the frame rate is high enough.
+
+Other timers exist and must not be confused with this one: `0xA558A0` drives the
+lighting cross-fade, `0x9D54A0` is a calendar-free clock with its own day and
+time-in-day.
+
+### The calendar
+
+`0x3346E0`, the day tick, called once per frame from `0x30D100` at `0x30D933`.
+It adds `PowerTime` to `game+0x59C` and rolls over at the `60.0f` at `0x90AA90`
+into `game+0x590` (day of year) and `game+0x594` (year).
+
+Its prologue reaches 14 bytes only through a RIP-relative `movss`, so it cannot
+be inline-hooked with a straight-`memcpy` trampoline.
+
+### What the day tick fires, once per calendar day
+
+Everything in this list runs **once per date and from nowhere else**, which is
+what makes it fall out of step with anything per-frame:
+
+| RVA | What |
+|---|---|
+| `0x4D5E80` | **pollution**. Accumulates each residential building's exposure at `building+0x11B0` from a sample capped at `3.0` and clamped to `1.0`, then subtracts a flat `0.06` and `0.005` from every cell of the grid |
+| `0x2552A0` | the fire roll, per building, gated on `game+0x5D0` |
+| `0x4B95C0` | **loans**: `0x4B93F0` per loan, then drop the ones that are paid off |
+| `0x4CD2B0` | expiring notifications — a countdown at `+0x10` of each, freed at zero |
+| `0x483880` | the random-event roll, gated on `game+0x5CC` |
+| `0x2FB130` | the price recompute, on days 5/10/15/20/25 and at each month change |
+| `0x1A7720` | per city, gated on `game+0x5BC` |
+| — | the snow-cover clear: on the day after winter ends, every terrain tile's byte buffer at `+0xE8` is zeroed |
+| — | dated events over the `0x9F08`-byte records at `game+0x12840`, matching `(year, day)` at `+0x9B50` and `+0x9B58` |
+
+### The pollution grid
+
+| Where | What |
+|---|---|
+| `game+0x120A8` | base of the grid, 12 bytes per cell |
+| `game+0x120C0` | cell count |
+| `game+0x120B0` / `+0x120B4` | world origin |
+| `game+0x120B8` / `+0x120BC` | width, height in cells |
+| cell `+0x00` | one pollutant, decays `0.005`/day (`0x909B68`) |
+| cell `+0x04` | the other, decays `0.06`/day (`0x909C40`), clamped to 1.0 on emission |
+| `game+0x5D4` | the "pollution enabled" rule; nothing emits or decays without it |
+| `game+0x1444C` | the cheat menu's "speed up pollution" checkbox — **its readers are the emitters**: `0x137B30`, `0x14B930`, `0x1B1220`, `0x1B3690`, `0x1C9FB0`, `0x1CAD50`, `0x1CE930`, `0x1CF520`, `0x1D1E10`, `0x488D92` |
+
+`0x4D56D0` is the emitter — `(world, position, amount, spread, whichField)`,
+scattering into a random nearby cell. `0x4D5B60` samples it back, bilinearly.
+The cheat menu's "reset pollution" button at `0x33C2A8` zeroes both fields of
+every cell, which is how the layout was read.
+
+### Loans
+
+The list is a `vector` of `0x28`-byte records at `game+0x10BD0`, with the
+selected index at `game+0x10BE8` and the four running totals at `game+0x11718`…
+`+0x11724`. Balances live at `game+0x580` (roubles) and `game+0x588` (dollars).
+
+| Offset | What |
+|---|---|
+| `+0x00` | interest rate, per cent |
+| `+0x08` | currency: `1` is roubles, anything else dollars |
+| `+0x10` | **term remaining, in calendar days.** `0x4B93F0` decrements it |
+| `+0x14` | principal outstanding |
+| `+0x18` | interest outstanding |
+| `+0x24` | total paid so far |
+
+The daily payment is `outstanding / days-left`, so it is entirely driven by the
+day counter; the record is dropped when both `+0x14` and `+0x18` fall below 1.
+
+### Seasons
+
+`0x334340` — `char IsSnowSeason(world)` — reads `world+0x590` and the climate at
+`[[0x9941F0]+0xED8]+0x8EC`, and answers whether that day of the year is in the
+snow part of it. **120 bytes, and it references its argument exactly twice, both
+`[arg+0x590]`** — so it can be asked on a scratch object.
+
+| Climate | Winter when |
+|---|---|
+| 0 | `day <= 52` or `day > 247` |
+| 1 | `day <= 25` or `day > 326` |
+| 2 | `day <= 50` or `day > 326` |
+| 3 | `day <= 128` or `day > 245` |
+
+Every season is therefore at least a hundred days long, which is what makes a
+residue class modulo 13 always have a representative inside the current one.
 
 ## Globals
 

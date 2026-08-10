@@ -132,12 +132,16 @@ winner is the only one that leaves a trace once the game is up.
 
 ### The version gate
 
-Every address in this project belongs to **v1.1.1.7**, PE `TimeDateStamp`
-`0x69C4098C`. A patch site verifies its own bytes and refuses on a mismatch, so
-a game update makes each hook decline rather than corrupt the process — but that
-is a dozen separate refusals in a log file nobody reads, after the game is
-already running. The launcher asks once, before the process exists, and refuses
-to inject at all.
+Every address in this project belongs to **v1.1.1.9**, PE `TimeDateStamp`
+`0x6A3EB6AD` (2026-06-26) — the build the regular branch updated to on
+2026-08-11, from v1.1.1.7 (`0x69C4098C`). The update's own notes called it
+content-only; it was not, at the byte level — see *Porting off v1.1.1.7*
+below — and every address in this project was re-derived against the new
+build rather than kept as a second table entry. A patch site verifies its own
+bytes and refuses on a mismatch, so a future update makes each hook decline
+rather than corrupt the process — but that is a dozen separate refusals in a
+log file nobody reads, after the game is already running. The launcher asks
+once, before the process exists, and refuses to inject at all.
 
 **`SOVIET64.exe` has no `VERSIONINFO` resource** — `FileVersion` is `0.0.0.0` —
 so there is nothing to ask the shell. The version is read out of the only place
@@ -147,36 +151,82 @@ inject into that file and must not map it first.
 
 | Step | What |
 |---|---|
-| 1 | find `"v%d.%d.%d.%d (64 bit DX11.1)"` in `.rdata` → rva `0x8961E0` |
-| 2 | scan `.text` for the one rip-relative `lea` that resolves to it → `0x28C788` |
+| 1 | find `"v%d.%d.%d.%d (64 bit DX11.1)"` in `.rdata` |
+| 2 | scan `.text` for the one rip-relative `lea` that resolves to it — nothing here is hard-coded, which is exactly why this step alone survived the port unchanged |
 | 3 | read the four immediates out of the 64 bytes in front of it |
 
-In this build those bytes are `mov [rsp+0x20], 7` / `mov edx, 1` /
-`mov r9d, edx` / `mov r8d, edx` — so 1.1.1 comes from a single immediate and the
+Those bytes are `mov [rsp+0x20], build` / `mov edx, major` / `mov r9d, edx` /
+`mov r8d, edx` — so `major.minor.patch` comes from a single immediate and the
 build number from the fifth argument's stack slot. The scan is not a
-disassembler: it looks for the exact encodings that can put a small constant in
-each of those four argument slots and takes the last write to each. **Anything
-it does not recognise leaves the numbers unread rather than wrong**, and the
-`TimeDateStamp` then decides alone.
+disassembler: it looks for the exact encodings that can put a small constant
+in each of those four argument slots and takes the last write to each.
+**Anything it does not recognise leaves the numbers unread rather than
+wrong**, and the `TimeDateStamp` then decides alone.
+
+`kSupportedVersions` in `tesmiolauncher.cpp` is a table of one entry rather
+than a bare pair of constants, checked in full:
 
 | Numbers | Stamp | Verdict |
 |---|---|---|
-| 1.1.1.7 | matches | supported |
-| 1.1.1.7 | differs | supported, *"a different build of it"* — a hotfix that left the printed version alone. Allowed, and said out loud |
-| anything else | — | **refused** |
-| unreadable | matches | supported — the stamp is the stronger fact and this exe is byte-identical to the one it names |
-| unreadable | differs | **refused** |
+| match the entry | matches its stamp | supported |
+| match the entry | differs from its stamp | supported, *"a different build of it"* — a hotfix that left the printed version alone. Allowed, and said out loud |
+| match nothing | — | **refused** |
+| unreadable | matches the stamp | supported — the stamp is the stronger fact and this exe is byte-identical to the one it names |
+| unreadable | does not match | **refused** |
 
 Both facts are shown in the window and printed by `--find`, which exits `2` when
 the game it found would not be launched. `version_check = 0` in
 `tesmioloader.ini`, or `--ignore-version`, turns the refusal into a warning —
-that switch is for whoever is porting the addresses to a new build, and it is
-deliberately not a checkbox.
+that switch is for whoever is porting the addresses to a build the table does
+not name, not for playing on one.
 
 The supported version is **compiled in**, not configurable. It is not a
 preference: it is a statement about which addresses this binary was built with,
 and a config key for it would only produce a launcher that injects confidently
-into a game it cannot patch.
+into a game it cannot patch. During the v1.1.1.7 → v1.1.1.9 port the table
+briefly held both builds, which is the whole reason it is a table and not a
+pair of `#define`s — a future update can add a row the same way, and drop the
+old one once its addresses are gone from the tree, exactly as v1.1.1.7's were.
+
+### Porting off v1.1.1.7
+
+What the port actually found, kept here because it is the one thing worth
+knowing before trusting an update's own description of itself:
+
+- **`.text` did not shift by one constant.** It grew in steps as the update's
+  content pulled in more code ahead of a given point: `+0`, `-0x10`, `+0x70`,
+  `+0xA0`, `+0xD0`, `+0x120`, `+0x1E0`, increasing the further into `.text` a
+  site sat. A single global delta would have found nothing past the first
+  step.
+- **`.rdata`'s float-literal pool moved too** — by a uniform `-0x18` across
+  the cluster every layout constant and rate this project reads sits in, and
+  by `-0x20` in a second cluster further along (three UI tint colours, one
+  overlay-shader vector). Two different shifts fifteen hundred bytes apart in
+  the same section, confirmed independently by the *value* now at each
+  candidate address, not assumed from the first one that worked.
+- **`.data` did not move at all.** The game object, the resource vector, the
+  simulation timer, every static this project reads by absolute address —
+  unchanged, confirmed by the `lea` sites that resolve them still landing on
+  the same targets.
+- **A game constant changed value, not just address**: `daynight`'s day
+  length went from `60.0` to `63.0`. Genuinely content, and indistinguishable
+  from an address problem until checked — a stale `RVA_DAY_LENGTH` would have
+  refused to install with no other symptom.
+- **The method**: a prologue/pattern scanner over the byte arrays every hook
+  already records as its expected prologue, filtered against the PE's own
+  `.pdata` `RUNTIME_FUNCTION` table so a match had to be a genuine function
+  start rather than a coincidental byte run inside one. Where a pattern alone
+  was ambiguous - several candidates, or none - the tie-break was the code
+  itself: what a function's body still reads (`+0xC300` for easystart's
+  cached shop-goods records, `+0x11B08` for accumulator's building vector),
+  what a `movss` still resolves to, which `.pdata` candidate's *size* looked
+  like the right kind of function.
+- **One crash, and it was a plugin-contract bug the port exposed rather than
+  a wrong address**: `resources` installed a `C3D_LANGUAGE::GetString` import
+  hook before its `ResourceGet` inline hook, and when the latter's address
+  turned out to have moved, the host freed `resources.dll` with that import
+  hook still live in it. See `docs/09-plugins.md` and the fix in
+  `resources.cpp`.
 
 ### The window
 
@@ -390,7 +440,7 @@ everything a feature needs lives in that plugin's own ini.
 | `plugins` | scan `plugins\` and load what is there |
 | `menu_patch` | append `menu_tag` to the main menu's version line |
 | `version` | this build's version, shown in the launcher's title bar |
-| `version_check` | **launcher only.** 0 injects into a game that is not v1.1.1.7. Absent means 1 |
+| `version_check` | **launcher only.** 0 injects into a game that is not v1.1.1.9. Absent means 1 |
 
 `menu_tag` also lives in this section, but it is not a setting: tesmiolauncher's
 SaveConfig derives it from `version` (`"tesmioloader v. " + version`) and

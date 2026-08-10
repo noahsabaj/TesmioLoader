@@ -5,7 +5,6 @@ build/
 tools/
 src/tesmio_pubkey.h
 src/tesmio_sign.h
-btfconvert/btfconvert.exe
-btfconvert/obj/
+btfconvert/
 tsmsign.obj
 идеи.txt

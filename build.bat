@@ -75,11 +75,22 @@ if exist tools\signing\tsmsign.cpp if exist src\tesmio_sign.h (
 
 rem Plugins. One folder per plugin under plugins\, each holding <name>.cpp and
 rem optionally <name>.ini; both land in build\plugins\, which is what the loader
-rem scans. Adding a plugin is adding a folder - nothing here lists them.
+rem scans. Adding a plugin is adding a folder - nothing here lists them, except
+rem the two below held back on purpose.
 if not exist build\plugins mkdir build\plugins
 
+rem aging and buildings are parked, not gone: aging is a probe with no feature
+rem behind it yet (docs/02-findings.md, "Where the age is not"), and buildings
+rem writes into the game's own workshop_wip folder, which wants a deliberate
+rem look after a game update before it runs again. Skipping them here is the
+rem whole of it - the folders, source and .ini are untouched, and deleting this
+rem block is the whole of turning either back on.
 for /d %%P in (plugins\*) do (
-    if exist "%%P\%%~nxP.cpp" (
+    if /i "%%~nxP"=="aging" (
+        echo [build] plugins\aging: skipped, parked - see build.bat
+    ) else if /i "%%~nxP"=="buildings" (
+        echo [build] plugins\buildings: skipped, parked - see build.bat
+    ) else if exist "%%P\%%~nxP.cpp" (
         echo [build] plugins\%%~nxP.dll
         cl /nologo /O2 /MT /W3 /EHsc /LD ^
            /Fo"build\plugins\\" /Fd"build\plugins\\" /Fe"build\plugins\%%~nxP.dll" ^
