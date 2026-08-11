@@ -101,9 +101,10 @@ anything.
 
 1. `step = C3D_TIMER::PowerTime(timer, 0.001)` — the same call the tick itself
    opens with.
-2. `tonnes = step / 60 × building[0xDDC]`. `60` is `[0x90AA90]`, and this is the
-   game's own conversion: it is how the water branch of `0x1B1220` turns that
-   same field into a quantity.
+2. `tonnes = step / 60 × building[0xDDC]`. `60` is `[0x90AA78]` (this build —
+   `0x90AA90` shifted and now holds an unrelated `63`, see `daynight`'s day
+   length), and this is the game's own conversion: it is how the water branch
+   of `0x1B1220` turns that same field into a quantity.
 3. `units = tonnes × 255 / tonnes_per_texel`, taken off the mine's `reserve` and
    added to its `spent`.
 4. `building[0xDF8] = baseQuality × reserve / reserve0`.

@@ -904,7 +904,7 @@ into, and the whole game asks it what kind of building this is:
 | Type offset | Contents |
 |---|---|
 | `+0x360` | the `BUILDINGTYPE_*` number — 2 living, 3 shop, 6 factory, 7 mine, 8 field, 17 powerplant, 18 substation, 19 transformer, 30 unknown… |
-| `+0x364` | a second, finer number. Living buildings are told apart by `+0x360 == 2 && +0x364 == 1` |
+| `+0x364` | a second, finer number, read widely across `.text` (500+ sites) but never against `1` for the living case specifically - **the `== 1` half of the old claim here was a guess and was wrong**, caught by `easystart`'s building sweep matching zero of 668 buildings in a real save. `+0x360 == 2` alone is BUILDINGTYPE_LIVING per `SOVIETInstructions.txt` and shares its number with nothing else, so it is sufficient on its own |
 | `+0x814` | divisor in the shop's tourist-spending term |
 
 Both are initialised to `0x1E` — 30, `BUILDINGTYPE_UNKNOWN` — at `0x10DFF9`
@@ -1315,8 +1315,8 @@ time-in-day.
 ### The calendar
 
 `0x3346E0`, the day tick, called once per frame from `0x30D100` at `0x30D933`.
-It adds `PowerTime` to `game+0x59C` and rolls over at the `60.0f` at `0x90AA90`
-into `game+0x590` (day of year) and `game+0x594` (year).
+It adds `PowerTime` to `game+0x59C` and rolls over at the `60.0f` at `0x90AA78`
+(this build) into `game+0x590` (day of year) and `game+0x594` (year).
 
 Its prologue reaches 14 bytes only through a RIP-relative `movss`, so it cannot
 be inline-hooked with a straight-`memcpy` trampoline.
@@ -1326,13 +1326,13 @@ be inline-hooked with a straight-`memcpy` trampoline.
 Everything in this list runs **once per date and from nowhere else**, which is
 what makes it fall out of step with anything per-frame:
 
-| RVA | What |
+| RVA (this build) | What |
 |---|---|
-| `0x4D5E80` | **pollution**. Accumulates each residential building's exposure at `building+0x11B0` from a sample capped at `3.0` and clamped to `1.0`, then subtracts a flat `0.06` and `0.005` from every cell of the grid |
-| `0x2552A0` | the fire roll, per building, gated on `game+0x5D0` |
-| `0x4B95C0` | **loans**: `0x4B93F0` per loan, then drop the ones that are paid off |
-| `0x4CD2B0` | expiring notifications — a countdown at `+0x10` of each, freed at zero |
-| `0x483880` | the random-event roll, gated on `game+0x5CC` |
+| `0x4D5F50` | **pollution**. Accumulates each residential building's exposure at `building+0x11B0` from a sample capped at `3.0` and clamped to `1.0`, then subtracts a flat `0.06` and `0.005` from every cell of the grid |
+| `0x2552A0` | the fire roll, per building, gated on `game+0x5D0` — not re-verified against this build |
+| `0x4B9660` | **loans**: `0x4B9490` per loan, then drop the ones that are paid off |
+| `0x4CD380` | expiring notifications — a countdown at `+0x10` of each, freed at zero |
+| `0x483880` | the random-event roll, gated on `game+0x5CC` — not re-verified against this build |
 | `0x2FB130` | the price recompute, on days 5/10/15/20/25 and at each month change |
 | `0x1A7720` | per city, gated on `game+0x5BC` |
 | — | the snow-cover clear: on the day after winter ends, every terrain tile's byte buffer at `+0xE8` is zeroed |
@@ -1349,12 +1349,16 @@ what makes it fall out of step with anything per-frame:
 | cell `+0x00` | one pollutant, decays `0.005`/day (`0x909B68`) |
 | cell `+0x04` | the other, decays `0.06`/day (`0x909C40`), clamped to 1.0 on emission |
 | `game+0x5D4` | the "pollution enabled" rule; nothing emits or decays without it |
-| `game+0x1444C` | the cheat menu's "speed up pollution" checkbox — **its readers are the emitters**: `0x137B30`, `0x14B930`, `0x1B1220`, `0x1B3690`, `0x1C9FB0`, `0x1CAD50`, `0x1CE930`, `0x1CF520`, `0x1D1E10`, `0x488D92` |
+| `game+0x1444C` | the cheat menu's "speed up pollution" checkbox — **its readers are the emitters**: `0x137B30`, `0x14B930`, `0x1B1220`, `0x1B3690`, `0x1C9FB0`, `0x1CAD50`, `0x1CE930`, `0x1CF520`, `0x1D1E10`, `0x488D92` — this row not re-verified against this build |
 
-`0x4D56D0` is the emitter — `(world, position, amount, spread, whichField)`,
-scattering into a random nearby cell. `0x4D5B60` samples it back, bilinearly.
-The cheat menu's "reset pollution" button at `0x33C2A8` zeroes both fields of
-every cell, which is how the layout was read.
+The emitter — `(world, position, amount, spread, whichField)`, scattering into
+a random nearby cell — is not re-verified against this build; it was at
+`0x4D56D0` before the daynight 2.1 investigation re-derived its neighbours. The
+sampler, which reads it back bilinearly, is confirmed at `0x4D5C30` (was
+`0x4D5B60`) — the pollution decay pass calls it directly and both were read off
+a fresh, fully re-analysed Ghidra import. The cheat menu's "reset pollution"
+button zeroes both fields of every cell, which is how the layout was read
+originally; its own address is not re-verified either.
 
 ### Loans
 
@@ -1366,7 +1370,7 @@ selected index at `game+0x10BE8` and the four running totals at `game+0x11718`�
 |---|---|
 | `+0x00` | interest rate, per cent |
 | `+0x08` | currency: `1` is roubles, anything else dollars |
-| `+0x10` | **term remaining, in calendar days.** `0x4B93F0` decrements it |
+| `+0x10` | **term remaining, in calendar days.** `0x4B9490` (this build) decrements it |
 | `+0x14` | principal outstanding |
 | `+0x18` | interest outstanding |
 | `+0x24` | total paid so far |
@@ -1376,10 +1380,10 @@ day counter; the record is dropped when both `+0x14` and `+0x18` fall below 1.
 
 ### Seasons
 
-`0x334340` — `char IsSnowSeason(world)` — reads `world+0x590` and the climate at
-`[[0x9941F0]+0xED8]+0x8EC`, and answers whether that day of the year is in the
-snow part of it. **120 bytes, and it references its argument exactly twice, both
-`[arg+0x590]`** — so it can be asked on a scratch object.
+`0x3343E0` (this build) — `char IsSnowSeason(world)` — reads `world+0x590` and
+the climate at `[[0x9941F0]+0xED8]+0x8EC`, and answers whether that day of the
+year is in the snow part of it. **120 bytes, and it references its argument
+exactly twice, both `[arg+0x590]`** — so it can be asked on a scratch object.
 
 | Climate | Winter when |
 |---|---|
@@ -1642,7 +1646,7 @@ the decompiler.
 | RVA | Value | What |
 |---|---|---|
 | `0x909B14` | 0.001 | the argument every `PowerTime` call in the simulation passes |
-| `0x90AA90` | 60 | what a production rate is divided by per tick |
+| `0x90AA78` | 60 | what a production rate is divided by per tick — this build; `0x90AA90` now holds an unrelated `63` (see `daynight`'s day length, same shift) |
 | `0x909F70` | 1.0 | the one-second rollover, and the general-purpose 1 |
 | `0x90A840` | 10 | deposit sample grid step, world units |
 | `0x90AD50` | 210 | search radius for iron, coal and uranium |

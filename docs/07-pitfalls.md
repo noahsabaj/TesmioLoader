@@ -3,6 +3,66 @@
 Every entry here cost at least one debugging session. Most were the loader's
 fault, not the game's. Read this before assuming a crash is the game misbehaving.
 
+## Check the build stamp before you trust a single address
+
+`easystart` 1.0 was reverse engineered, written, built and shipped against the
+copy of `SOVIET64.exe` that was on disk at the time. Steam updated the game part
+way through, and every code address in the plugin was then wrong: `+0x70` in the
+`0x1Bxxxx` region, `+0xA0` around `0x488xxx`, `+0x1E0` at `0x83Axxx`, and `+0`
+in `0x76xxxx` and `0x82xxxx`. The reflow is **not monotonic**, so no single
+shift can be applied and nothing can be inferred from a neighbour.
+
+What made it visible was a disassembly that disagreed with an earlier one of the
+same address in the same session. What settles it in one line:
+
+```
+python -c "import struct;d=open(r'...\SOVIET64.exe','rb').read();print(hex(struct.unpack_from('<I',d,struct.unpack_from('<I',d,0x3c)[0]+8)[0]))"
+```
+
+`0x69C4098C` is v1.1.1.7, `0x6A3EB6AD` is v1.1.1.9. The launcher prints the same
+thing with `--find`, and it is the first thing to run after any session that
+spans a Steam update.
+
+Three things limited the damage and are worth keeping:
+
+- **`.data` does not move.** Both reason ledgers, the game object and the
+  resource vector were at the same addresses in both builds, so every structure
+  offset and every global survived.
+- **`.rdata`'s float pool moved by a uniform `-0x18`**, so a constant is found
+  by its *value*, never by its address.
+- **Every site verifies its own bytes before writing**, so the wrong-build
+  plugin would have refused rather than corrupted anything — which is the whole
+  reason that rule exists.
+
+Re-deriving is cheap when the original discovery was pattern-driven rather than
+address-driven: the twelve rate sites were found again by scanning a window
+around each old address for the same opcode *whose displacement resolves to a
+constant holding the same value*, and the evaluator by the five-way
+`cmp dword [rsi+8], 3/4/5/6/10` chain that no other function has.
+
+## A need has four faces, and gating one gates one
+
+`easystart` 1.0 removed a locked need from the citizen's demand list, which is
+where happiness and health are decided, and the status bars in the building
+window duly read 100 %. The window above them still said *56 Citizen(s)
+currently without power*, *13 Children can't go to school* and *8 Workers can't
+work because all kindergartens are inaccessible*.
+
+Nothing was broken. A need in this game is expressed in four independent places
+and the happiness ledger is only the first:
+
+| Face | Where | Example |
+|---|---|---|
+| the citizen's demand | `person+0x118` | *Unable to enjoy culture* |
+| a per-inhabitant rate | the building tick | *No electricity* |
+| a counter the window prints | `building+0x1108`…`+0x1120` | *56 Citizen(s) without power* |
+| a real mechanic | `game+0x5DC` | a parent held at home by a child |
+
+The lesson generalises past this plugin: **the statistics ledger is the map of
+what a need costs, not the map of what a need is.** Before declaring a feature
+that suppresses something, open the one window that shows it and read every
+line, because the panel reaches state the simulation keeps for its own reasons.
+
 ## The BOM that disabled everything
 
 PowerShell 5.1's `-Encoding UTF8` writes a byte-order mark. Prepend one to
@@ -967,23 +1027,25 @@ from the day tick and from nowhere else. Slowing only the second put the two a
 factor of thirteen apart, and the damage was in places nobody would think to
 look at after changing the sky:
 
-- **Pollution.** `0x4D5E80` subtracts a flat `0.06` and `0.005` from every cell
-  of the grid once per date. Emission is per frame. Thirteen times the emission
-  between two subtractions, so it never settles.
+- **Pollution.** The daily decay pass subtracts a flat `0.06` and `0.005` from
+  every cell of the grid once per date. Emission is per frame. Thirteen times
+  the emission between two subtractions, so it never settles.
 - **Winter.** The same daily pass pins every home at full pollution exposure once
   the grid runs away, and local heating — which is what runs in winter — is one
   of the emitters. Citizens sicken and the population falls. The season
   boundaries are days of the year, so each winter also lasts thirteen times
   longer on the wall clock.
-- **Loans.** `0x4B93F0` decrements a term counted **in days** and pays
-  `outstanding / days-left`, once per date, out of an income that did not slow.
+- **Loans.** The per-loan payment function decrements a term counted **in
+  days** and pays `outstanding / days-left`, once per date, out of an income
+  that did not slow.
 - Used-vehicle offers, expiring notifications and the random-event roll: same
   shape, same cause.
 
 None of these was found by reading the plugin. They were reported from a real
 game as three unrelated-sounding bugs — "extra pollution", "the population
 collapses in winter", "the loan starts over every day" — and only turned out to
-be one thing after `0x4D5E80` and `0x4B95C0` were traced back to the day tick.
+be one thing after the pollution and loan daily passes were traced back to the
+day tick.
 
 Lessons:
 
@@ -992,11 +1054,20 @@ Lessons:
   to tell them apart is to find the code that increments them.
 - **A rate change is not local.** Scaling one clock in a simulation that has two
   is a change to every ratio between them, and there is no list of those.
-- **Scale the whole clock or none of it.** The fix was to stop touching the
-  calendar and scale the simulation timer instead, which is what the game's own
-  speed buttons already do — `0x105A90` multiplies `timer[0]` by 0.35, 0.05 or
-  0.01. Riding the mechanism the game already has is what makes "everything
-  slows in step" true by construction rather than by an audit.
+- **"Scale the whole clock or none of it" was the second answer, and it was also
+  wrong — too broad rather than too narrow.** Scaling the simulation timer
+  instead of the calendar (riding the same mechanism the game's own speed
+  buttons use — `0x105A90` multiplies `timer[0]` by 0.35, 0.05 or 0.01) does
+  make "everything slows in step" true by construction, and it is the correct
+  answer if "everything" really is what should slow. It was not: walking,
+  vehicle speed and construction slowing along with the calendar read as the
+  whole world stuck rather than a longer day, and that was only found by
+  watching it in game — see "Slowing a shared clock slows everything that
+  reads it" below. The eventual fix scales neither the calendar's whole
+  neighbourhood nor the whole simulation: it touches only the calendar field
+  and separately drives the two or three functions that specifically need to
+  stay in step with per-frame time, by calling them directly rather than by
+  broadening what a shared clock reaches.
 - **Scaling three functions and not the fourth is the same bug again, smaller.**
   The executable imports `Power`, `PowerTime` *and* `PowerKmh`; the last is
   vehicle speeds. Swapping the time and leaving the traffic at full speed would
@@ -1006,22 +1077,102 @@ Lessons:
 ## A residue class is not a date
 
 The same plugin invents a day of the year congruent to the phase it wants
-modulo 13 and hands it to the weather machine. Version 1.x took *the next one at
+modulo 13 and hands it to the weather machine. Version 1.0 took *the next one at
 or after the real date*, which is up to twelve days ahead.
 
 That is fine while the only thing reading it is `% 13`. It is not fine because
-`0x333B30` also passes it to the snow-season test at `0x334340` and compares it
-against 284/326/328 for the overcast season. As the phase advances through one
+the weather tick also passes it to the snow-season test and compares it
+against the winter boundaries per climate. As the phase advances through one
 calendar day the invented date sweeps the whole thirteen-day window — and near a
 winter boundary that window straddles it, so the weather flips in and out of
 winter thirteen times a day.
 
 The fix is to keep the congruence and add a second condition: walk the
 representatives outward from the real date and take the first one the game's own
-`0x334340` puts in the same season. Every season in that function is at least a
+season test puts in the same season. Every season in that function is at least a
 hundred days long and the representatives are thirteen apart, so one always
 exists.
 
 Lesson: **when you fake a value, enumerate every consumer of it, not just the
 one you are aiming at.** A field's meaning is the union of what reads it, and
 `% 13` was only the loudest reader.
+
+## A matching PE timestamp does not mean an unchanged binary
+
+While tracking down the daily-pass functions for `daynight` 2.1, a Ghidra
+project imported earlier in the same investigation gave function boundaries
+that made no sense — a 484-byte function reported as 1119 bytes, containing
+what looked like three merged functions, and a `.pdata`-based scan of the raw
+exe (`tools/pe`'s own function-boundary lookup) turning up gaps where a
+well-formed x64 function should have unwind info.
+
+The cause: the exe on disk had been rebuilt between the Ghidra project's import
+and this check, **while keeping exactly the same PE `TimeDateStamp`**
+(`0x6A3EB6AD`) the project table names as this build's own. Six addresses this
+plugin already depended on — the weather tick, the light factor, the
+snow-season test, the day-length constant, the cross-fade `mov` and the day
+tick's own `PowerTime` call site — had already been correctly re-derived by
+that point (a `+0xA0`/`+0xD0`/`−0x18`-style shift, consistent with content
+inserted earlier in `.text`); the three daily-pass addresses this session was
+adding had not, and were still pointing at whatever those bytes had become in
+the new layout.
+
+Two things saved this from becoming a silent wrong-function call, which would
+have run arbitrary game code that happened to live at a plausible-looking
+address:
+
+- **Every address here is still checked against expected bytes before it is
+  trusted**, per the project rule — the mismatch was caught by the prologue
+  comparison, not discovered in game.
+- **The re-derivation methodology (string/constant scan, cross-checked against
+  a fresh, fully-analysed Ghidra project) does not care whether the timestamp
+  moved.** Re-running it against the live file found the three functions again
+  at their new addresses — `484`, `229` and `189` bytes respectively, identical
+  to the old ones byte-for-byte in field layout, just relocated — and a
+  from-scratch Ghidra import (`-import`, not `-noanalysis` against a stale
+  project) confirmed the same boundaries independently.
+
+Lesson: **treat a Ghidra project, or any address recorded in a previous
+session, as a claim about a specific file, not about "the game."** The
+`TimeDateStamp` this project already checks at launch is the right idea but is
+not sufficient on its own to prove a project's cached addresses are current —
+it is a field the build pipeline evidently does not always bump. When
+addresses that used to check out stop matching, or a function's reported size
+no longer makes sense, the fix is to re-derive against the file that is
+actually on disk right now, not to adjust the tooling to tolerate the
+mismatch.
+
+## Slowing a shared clock slows everything that reads it, including the parts nobody meant to touch
+
+`daynight` 2.0 scaled the one `C3D_TIMER` the whole simulation is integrated
+from, specifically so that pollution, loans and every other per-day system
+would stay in step with the per-frame systems they balance against — and it
+worked, exactly as designed. What was not anticipated until it was watched in
+game: **that same timer is what walking, vehicle speed, construction and every
+animation are integrated from too**, because "the whole simulation" is not a
+figure of speech - 337 sites in the executable read that one object. At the
+default thirteen-times stretch this did not read as "the day is longer," it
+read as the entire world running in slow motion, and vehicles - already the
+slower of the two per raw unit in the base game - became slower than a walking
+citizen.
+
+The fix (version 2.1) is not a smaller scale factor - any nonzero factor
+applied to the shared timer slows movement by exactly that factor, so there is
+no value of `day_scale` that fixes this while still stretching the day
+noticeably. It is scaling something *narrower*: touch only the calendar field,
+and drive the handful of functions that specifically need to stay in step with
+per-frame time by calling them directly, at their own natural cadence,
+independent of the display. See "Slowing one clock in a game that keeps two"
+above for why the calendar-alone approach was rejected the first time; this is
+the same lesson from the other side - scale too broad a mechanism and
+correctness is easy, scale too narrow a one and desync comes back, and the
+answer is neither "which one" in isolation but "the widest mechanism that
+excludes the things that must not move."
+
+Lesson: **"the whole simulation" in a description like the one this plugin's
+own source carried is not scoped by what you were thinking about when you
+wrote the hook - it is scoped by what the hooked function actually is.**
+Before scaling a shared resource, enumerate what else reads it, not just what
+you intended to fix - `python scan.py ref <address>` finding 337 call sites for
+one timer was exactly the information that should have prompted asking "what
+are all of these," not just "does the economy come out right."

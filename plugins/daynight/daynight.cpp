@@ -11,11 +11,12 @@
 //
 // and the day tick at 0x3346E0 is the whole of it: it adds
 // `C3D_TIMER::PowerTime` to +0x59C every frame and, the moment that passes the
-// 60.0f at 0x90AA90, zeroes it, increments +0x590 and wraps at 365 into +0x594.
-// One calendar day is therefore 60 units of scaled game time and nothing else.
+// 60.0f at 0x90AA78 (this build), zeroes it, increments +0x590 and wraps at
+// 365 into +0x594. One calendar day is therefore 60 units of scaled game time
+// and nothing else.
 //
 // The day and night themselves come from a completely separate state machine at
-// 0x333B30, and it steps once per **calendar day**:
+// 0x333BD0, and it steps once per **calendar day**:
 //
 //   phase = (day of year) % 13
 //
@@ -36,15 +37,16 @@
 // Scanning .text for the magic constant 0x4EC4EC4F - what the compiler emits
 // for a signed `% 13` - finds three sites and no more:
 //
-//   0x333BA5   in the weather state machine at 0x333B30. Reads game+0x590
-//   0x5CFBB1   in the light factor at 0x5CFB70. Reads game+0x590
-//   0x9795     in the lighting cross-fade at 0x8F50. Reads 0x9D54A0, which is
-//              **not** the world object - a separate clock. Left alone.
+//   in the weather state machine at 0x333BD0. Reads game+0x590
+//   in the light factor at 0x5CFC40. Reads game+0x590
+//   in the lighting cross-fade at 0x8F50. Reads 0x9D54A0, which is
+//   **not** the world object - a separate clock. Left alone.
 //
-// 0x5CFB70 is the second copy of the same 13-phase logic, written out again. It
-// returns a float - how lit the world is - and is read by the renderer and by
-// two of the electricity functions. Patching only the state machine would have
-// moved the sky and left the street lights on the old thirteen-day schedule.
+// The light factor is the second copy of the same 13-phase logic, written out
+// again. It returns a float - how lit the world is - and is read by the
+// renderer and by two of the electricity functions. Patching only the state
+// machine would have moved the sky and left the street lights on the old
+// thirteen-day schedule.
 //
 //
 // WHAT THIS PLUGIN DOES: IT LIES TO BOTH OF THEM ABOUT THE DATE
@@ -64,31 +66,32 @@
 //
 // The two hooks differ in how the lie is delivered, and deliberately:
 //
-//   0x333B30  WRITES to the world object - the weather index, the night factor
-//             and two flags - so it has to be handed the real object. The two
-//             fields are overwritten, the original is called, and they are put
-//             back. It runs on the simulation tick, immediately after the day
-//             tick that owns those fields (both are called back to back from
-//             0x30D100), so nothing else is looking at them in between.
+//   weather tick   WRITES to the world object - the weather index, the night
+//                  factor and two flags - so it has to be handed the real
+//                  object. The two fields are overwritten, the original is
+//                  called, and they are put back. It runs on the simulation
+//                  tick, immediately after the day tick that owns those
+//                  fields, so nothing else is looking at them in between.
 //
-//   0x5CFB70  READS and returns a float; it writes nothing. Every object field
-//             it touches was read out of its 482 bytes of disassembly -
-//             +0x5C4, +0x590, +0x59C, +0xE70, +0xE28, and no others - so it is
-//             handed a **scratch object of this plugin's own** with those five
-//             fields filled in. The world object is never touched, which is
-//             what makes it safe from the render thread.
+//   light factor   READS and returns a float; it writes nothing. Every object
+//                  field it touches was read out of its disassembly -
+//                  +0x5C4, +0x590, +0x59C, +0xE70, +0xE28, and no others - so
+//                  it is handed a **scratch object of this plugin's own** with
+//                  those five fields filled in. The world object is never
+//                  touched, which is what makes it safe from the render
+//                  thread.
 //
 // D' IS PICKED SO THAT IT LANDS IN THE SAME SEASON AS THE REAL DATE, and that
-// is not decoration. 0x333B30 does not only take `day % 13` off the field: it
-// also calls the snow-season test at 0x334340 with it, and compares it against
-// 284/326/328 for the overcast season. A residue class modulo 13 has a
-// representative every thirteen days, so version 1.x's "the next day at or
-// after the real one" swept a thirteen-day window over the course of a single
-// calendar day - and near a winter boundary that window straddles it, so the
-// weather flickered in and out of winter thirteen times a day. The plugin now
+// is not decoration. The weather tick does not only take `day % 13` off the
+// field: it also calls the snow-season test with it, and compares it against
+// the winter boundaries per climate. A residue class modulo 13 has a
+// representative every thirteen days, so taking "the next day at or after the
+// real one" sweeps a thirteen-day window over the course of a single calendar
+// day - and near a winter boundary that window straddles it, so the weather
+// would flicker in and out of winter thirteen times a day. This plugin instead
 // walks the representatives outward from the real date and takes the first one
-// the game's own 0x334340 puts in the same season. Every season is at least a
-// hundred days long, so one always exists.
+// the game's own season test puts in the same season. Every season is at least
+// a hundred days long, so one always exists.
 //
 //
 // AND THE CYCLE THEN RUNS THIRTEEN TIMES TOO FAST, WHICH IS THE OTHER HALF
@@ -99,94 +102,67 @@
 // the whole thirteen-step cycle goes by in that. It reads as "night tried to
 // start and changed its mind", because that is exactly what it looks like.
 //
-// `day_scale` is what makes a calendar day last longer, and **it scales the
-// whole simulation clock, not the calendar alone**. That distinction is the
-// entire content of version 2.0 and the reason it exists:
+// `day_scale` is what makes a calendar day last longer. Two versions have been
+// through this and got it wrong in opposite directions:
 //
-//   Version 1.x stretched the day by giving back most of what the day tick had
-//   just added to +0x59C. The calendar then advanced thirteen times slower in
-//   real time - and NOTHING ELSE DID. Every rate in the game is integrated from
-//   C3D_TIMER::PowerTime per frame, so production, consumption, heating and
-//   pollution kept running at their vanilla real-time pace while everything
-//   counted in calendar days ran thirteen times slower. That is not a cosmetic
-//   mismatch; it breaks the economy in specific, reproducible ways:
+//   Version 1.x stretched the CALENDAR ALONE by giving back most of what the
+//   day tick had just added to +0x59C. The date really did slow, and nothing
+//   else did: production, consumption, movement, everything is integrated per
+//   frame from C3D_TIMER::PowerTime, while pollution decay, loan repayment and
+//   notification expiry are called once per calendar day, from the day tick's
+//   own rollover branch and nowhere else. Slowing only the calendar made those
+//   three fire `day_scale` times less often than the per-frame systems they
+//   balance against - pollution never settled, loans never repaid, and the
+//   population starved in a winter that both ran away and lasted too long.
+//   See docs/07-pitfalls.md, "Slowing one clock in a game that keeps two".
 //
-//     * POLLUTION. The decay pass is FUN_1404d5e80 at 0x4D5E80, called once per
-//       calendar day from the day tick and from nowhere else (its only xref is
-//       0x334A64, inside 0x3346E0). It subtracts a flat 0.06 and 0.005 from
-//       every cell of the pollution grid at game+0x120A8. Emission is per
-//       frame, off PowerTime. Thirteen times the emission between two
-//       subtractions is thirteen times the pollution, and it never settles.
+//   Version 2.0 fixed that by scaling the WHOLE simulation clock - the shared
+//   C3D_TIMER at 0x9D4EE0 that PowerTime/Power/PowerKmh all divide by - so
+//   every per-day and every per-frame quantity slowed together and the economy
+//   stayed exactly the base game's, only slower in real time. That is honest,
+//   but it also slows walking, construction and vehicle speed by the same
+//   factor, and at the default 13x that reads as the whole world stuck in
+//   slow motion - reported after the fact, in game, as citizens walking like
+//   they are underwater and vehicles crawling slower than pedestrians.
 //
-//     * WINTER. Buildings with no district heating burn fuel locally and that
-//       emits pollution, so the runaway above peaks in winter - and the same
-//       daily pass accumulates each residential building's exposure at
-//       +0x11B0, clamped to 1.0, from a sample capped at 3.0. With the grid
-//       thirteen times too high every home pins at full exposure, citizens
-//       sicken, and the population falls. The season boundaries themselves are
-//       days of the year (25/50/52/128 and 245/247/326 by climate, in
-//       0x334340), so a thirteen-times-slower calendar also makes each winter
-//       thirteen times longer in real time.
+// VERSION 2.1 GOES BACK TO SLOWING THE CALENDAR ALONE, AND FIXES THE THING
+// THAT MADE THAT WRONG THE FIRST TIME. `slow = calendar` is the default again:
+// nothing but +0x59C is touched, so C3D_TIMER and everything that reads it -
+// walking, vehicles, construction, animation, production - keeps the base
+// game's own real-time pace. What changes is that the three functions that
+// broke under version 1.x are no longer left to the day tick's own, now-rare,
+// rollover:
 //
-//     * LOANS. The loan list is the 0x28-byte vector at game+0x10BD0 and
-//       FUN_1404b93f0 is its daily payment: it decrements the remaining TERM IN
-//       DAYS at record+0x10, compounds the interest, and pays
-//       balance / days-left. It is driven by FUN_1404b95c0, called once per
-//       calendar day from the day tick (only xref 0x334C48). Thirteen times
-//       fewer payments against an income that did not slow is a loan that never
-//       moves. Anything else scheduled by date - used-vehicle offers, expiring
-//       notifications at 0x4CD2B0, the random-event roll at 0x483880 - is the
-//       same story.
+//   pollution   0x4D5F50   decay the grid, accumulate residential exposure
+//   loans       0x4B9660   one day of interest and repayment, drop the paid
+//   notices     0x4CD380   age the notification/offer list, drop the expired
 //
-// So the fix is not to compensate each of them. It is to stop desynchronising
-// the two in the first place: the simulation clock itself is scaled, and every
-// per-day and every per-frame quantity slows by exactly the same factor. The
-// game is then bit-for-bit its vanilla self, running slower in real time.
-//
-// HOW: THE SIMULATION CLOCK IS ONE C3D_TIMER AND THE GAME ALREADY SCALES IT
-//
-// The whole simulation reads one timer, the C3D_TIMER at 0x9D4EE0 - 337 sites
-// reference it, the shop tick and the mine tick among them. C3D_TIMER::PowerTime
-// is four instructions:
-//
-//   if (this[0xC] && !ignorePause) return 0;
-//   if (this[0xD] && !realTime)    return 0;
-//   return v * K / (realTime ? this[4] : this[0]);
-//
-// this[0] is the frame rate the game time is divided by and this[4] is the real
-// one, which is why `realTime` callers must not be touched. And the game's own
-// speed control is a multiplication of exactly that field: 0x105A90 calls
-// C3D_TIMER::Start on it every frame and then multiplies it by 0.35, 0.05 or
-// 0.01 for the three speeds, or by 3, 5 or 1000 for the slow modes. **Scaling
-// it is not a new mechanism, it is one more speed step**, which is also why a
-// factor of thirteen is safe: the engine already ships a mode that divides the
-// step by a thousand.
-//
-// It is done as an import swap on the three C3D_TIMER::Power* the executable
-// imports rather than as a write to the field, because that is stateless: it
-// cannot compound if a frame runs the site twice and it cannot be missed if a
-// frame skips it. Only calls on 0x9D4EE0 with `realTime` false are scaled, so
-// the engine's own internal timing and every deliberate real-time query are
-// left exactly alone.
-//
-// THE COST IS REAL AND IT IS HONEST: the game runs `day_scale` times slower in
-// real time, all of it, in step. Raising the game speed cancels it exactly, and
-// now that really is true rather than merely claimed.
+// This plugin calls all three itself, directly, at the cadence the UNSLOWED
+// calendar would have used - tracked in a private accumulator fed by the true
+// PowerTime delta the day tick adds each frame, independent of what gets left
+// in +0x59C for display. So pollution decays, loans get paid and notices
+// expire at the base game's own real-time rate, while the date, the day/night
+// cycle and everything keyed to a specific day of the year - the weather roll,
+// the price recompute, the per-city tick - keep the deliberately slowed pace
+// that makes a sunrise and a sunset visible at all. `slow = world` (version
+// 2.0's behaviour) is kept for anyone who wants the uniform, honest-but-slow
+// alternative; `slow = none` turns day_scale off.
 //
 // The lighting cross-fade duration at game+0xED4 is the one number that does
-// not scale itself. 0x333F80 writes 15.0f into it on every weather change - a
-// quarter of a calendar day. Its own clock is the timer at 0xA558A0, not the
-// simulation one, so it is not slowed and the fade is rewritten to the same
-// fraction of the new phase after every tick.
+// not scale itself. 0x333F80-equivalent writes 15.0f into it on every weather
+// change - a quarter of a calendar day. Its own clock is the timer at
+// 0xA558A0, not the simulation one, so it is not slowed by any mode here and
+// the fade is rewritten to the same fraction of the new phase after every
+// tick.
 //
-// WHAT IS NOT FIXED, AND IS THE BASE GAME'S: 0x333F80 allocates two
-// C3D_LIGHTING objects on every weather change and never frees the previous
-// pair. Four changes per cycle used to mean four per thirteen days; it now
-// means four per day. Roughly 5 KB of leak per real minute at 1x speed - the
+// WHAT IS NOT FIXED, AND IS THE BASE GAME'S: the weather-change code allocates
+// two C3D_LIGHTING objects on every change and never frees the previous pair.
+// Four changes per cycle used to mean four per thirteen days; it now means
+// four per day. Roughly 5 KB of leak per real minute at 1x speed - the
 // textures behind them come from the managed cache and are not duplicated.
 //
 // Every address is SOVIET64.exe v1.1.1.9 and is verified byte for byte before
-// anything is hooked. See docs/15-daynight.md.
+// anything is hooked or called. See docs/15-daynight.md.
 
 #include "../../src/tesmio_plugin.h"
 
@@ -206,35 +182,37 @@
 // to agree with the real one about it.
 #define RVA_SNOW_SEASON   0x3343E0
 
-// The C3D_TIMER every simulation rate in the game is integrated from.
+// The C3D_TIMER every simulation rate in the game is integrated from. Only
+// touched in `slow = world` mode.
 #define RVA_SIM_TIMER     0x9D4EE0
 
-// In the day tick at 0x3346E0: `lea rcx,[sim timer]` / `xor r9d,r9d` /
-// `xor r8d,r8d` / `call qword ptr [PowerTime]` / `addss xmm0,[rbp+0x59C]`.
-// Verified as a unit, because between them those bytes prove that 0x9D4EE0 is a
-// C3D_TIMER, that this call is on it, and that **what comes back is added
-// straight into the calendar** - which is what makes the return address a
-// reliable way to tell the calendar's own tick from every other consumer.
+// In the day tick: `lea rcx,[sim timer]` / `xor r9d,r9d` / `xor r8d,r8d` /
+// `call qword ptr [PowerTime]`. Verified as a unit, because between them those
+// bytes prove that 0x9D4EE0 is a C3D_TIMER and that this call is on it -
+// needed only to confirm `slow = world` is scaling the right object.
 #define RVA_DAYTICK_POWER 0x334AA0
-#define RVA_DAYTICK_RET   (RVA_DAYTICK_POWER + 0x13)   // the instruction after the call
 
-// The three per-calendar-day passes worth running at the world's pace when the
-// world and the calendar are deliberately given different speeds. Each takes
-// the world object and nothing else, each is called from the day tick and from
-// nowhere else, and each is pure bookkeeping - so calling it again is exactly
-// "another day's worth happened", with no event, allocation or notification
-// invented that the game would not have made anyway.
-#define RVA_DAILY_POLLUTION 0x4D5E80   // decay the grid, accumulate exposure
-#define RVA_DAILY_LOANS     0x4B95C0   // one day of interest and repayment
-#define RVA_DAILY_NOTICES   0x4CD2B0   // age the notification list, drop the expired
+// The three per-calendar-day passes that integrate real elapsed time rather
+// than just bookkeeping the date, and so are the ones that desynchronise from
+// the per-frame systems they balance when the calendar alone is slowed. Each
+// takes the world object and nothing else, each is called from the day tick's
+// rollover branch and from nowhere else, and each is pure bookkeeping over
+// state that already exists - so calling it again is exactly "another day's
+// worth happened", with no event, allocation or notification invented that the
+// game itself would not eventually have made. Resolved and called directly,
+// like the snow-season test - never hooked, because nothing here needs to
+// intercept the day tick's own (rarer, but still genuine) calls to them.
+#define RVA_DAILY_POLLUTION 0x4D5F50   // decay the grid, accumulate exposure
+#define RVA_DAILY_LOANS     0x4B9660   // one day of interest and repayment
+#define RVA_DAILY_NOTICES   0x4CD380   // age the notification list, drop the expired
 
-// The 60.0f one calendar day lasts, as the day tick at 0x3346E0 reads it.
+// The 60.0f one calendar day lasts, as the day tick reads it.
 #define RVA_DAY_LENGTH    0x90AA78
 #define VANILLA_DAY_LEN   60.0f
 
-// `mov dword ptr [r10+0xED4], 0x41700000` in 0x333F80 - the cross-fade duration
-// written on every weather change. The opcode is checked and the immediate is
-// read rather than assumed.
+// `mov dword ptr [r10+0xED4], 0x41700000` - the cross-fade duration written on
+// every weather change. The opcode is checked and the immediate is read rather
+// than assumed.
 #define RVA_FADE_MOV      0x334224
 #define RVA_FADE_IMM      (RVA_FADE_MOV + 7)
 #define VANILLA_FADE      15.0f
@@ -243,7 +221,7 @@
 // shape and the same two frame-rate fields; the game uses PowerTime for time,
 // Power for a plain rate and PowerKmh for vehicle speeds, so scaling one and
 // not the others would leave the traffic running at full speed through a slow
-// world.
+// world. Only touched in `slow = world` mode.
 #define SYM_POWER         "?Power@C3D_TIMER@@QEAAMM_N0@Z"
 #define SYM_POWERTIME     "?PowerTime@C3D_TIMER@@QEAAMM_N0@Z"
 #define SYM_POWERKMH      "?PowerKmh@C3D_TIMER@@QEAAMM_N0@Z"
@@ -264,17 +242,18 @@
 // copy has to be at least this big.
 #define LIGHT_SCRATCH     0xE30
 
-// The snow-season test at 0x334340 reads one field of its argument, +0x590.
+// The snow-season test reads one field of its argument, +0x590.
 #define SEASON_SCRATCH    0x5A0
 
 // The number of phases in the game's own cycle. It is not a setting: it is how
-// many cases 0x333B30 and 0x5CFB70 are written with.
+// many cases the weather tick and the light factor are written with.
 #define PHASES            13
 
 #define DAYS_IN_YEAR      365
 
-// The most extra daily passes one tick may run, so a stall or a bad figure
-// cannot turn into a freeze.
+// The most catch-up daily passes one tick may run, so a long stall (alt-tab, a
+// debugger break) cannot turn into a burst of hundreds of calls on the frame
+// after.
 #define MAX_CATCHUP       64
 
 static const BYTE kWeatherTickPrologue[] = {
@@ -299,13 +278,38 @@ static const BYTE kSnowHead[]  = { 0x48, 0x8B, 0x05 };                     // mo
 static const BYTE kSnowTail[]  = { 0x48, 0x8B, 0x90, 0xD8, 0x0E, 0x00, 0x00,   // mov rdx,[rax+0xED8]
                                    0x44, 0x8B, 0x82, 0xEC, 0x08, 0x00, 0x00 }; // mov r8d,[rdx+0x8EC]
 
+// The three daily passes, verified by prologue before being trusted as
+// function pointers. `cmp [rcx+0x5D4],0` in the pollution one is the same
+// "is pollution simulated at all" gate the emitter and sampler use - calling
+// it when the setting is off is already a no-op inside the function itself.
+static const BYTE kDailyPollutionSig[] = {
+    0x4C, 0x8B, 0xDC,                                        // mov  r11,rsp
+    0x57,                                                     // push rdi
+    0x48, 0x83, 0xEC, 0x70,                                  // sub  rsp,0x70
+    0x83, 0xB9, 0xD4, 0x05, 0x00, 0x00, 0x00,                // cmp  dword ptr [rcx+0x5D4],0
+    0x48, 0x8B, 0xF9                                         // mov  rdi,rcx
+};
+static const BYTE kDailyLoansSig[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x10,                            // mov  [rsp+0x10],rbx
+    0x57,                                                     // push rdi
+    0x48, 0x83, 0xEC, 0x30,                                  // sub  rsp,0x30
+    0x48, 0x8B, 0x91, 0xD8, 0x0B, 0x01, 0x00                 // mov  rdx,[rcx+0x10BD8]
+};
+static const BYTE kDailyNoticesSig[] = {
+    0x48, 0x89, 0x74, 0x24, 0x18,                            // mov  [rsp+0x18],rsi
+    0x57,                                                     // push rdi
+    0x48, 0x83, 0xEC, 0x20,                                  // sub  rsp,0x20
+    0x48, 0x8B, 0xB1, 0x50, 0xD1, 0x00, 0x00                 // mov  rsi,[rcx+0xD150]
+};
+
 // ---------------------------------------------------------------- settings
 
-// What `day_scale` stretches - see daynight.ini for the full case against
-// SLOW_CALENDAR. SLOW_WORLD is 2.0's fix (the shared C3D_TIMER, scaling
-// everything the simulation runs off alike); SLOW_CALENDAR is 1.x's, kept only
-// as the control that reproduces the three bugs 2.0 fixed; SLOW_NONE is
-// `day_scale = 1`, no stretch at all.
+// What `day_scale` stretches - see daynight.ini for the full case. SLOW_CALENDAR
+// is the default: only +0x59C is touched, and the three daily-pass functions
+// above are driven manually to keep them at the un-slowed cadence. SLOW_WORLD
+// is 2.0's approach - the shared C3D_TIMER, scaling literally everything the
+// simulation runs off alike - kept for anyone who wants that trade-off on
+// purpose. SLOW_NONE is `day_scale = 1`, no stretch at all.
 enum { SLOW_NONE = 0, SLOW_CALENDAR = 1, SLOW_WORLD = 2 };
 
 static int   g_enabled    = 1;
@@ -313,7 +317,7 @@ static int   g_cycleDays  = 1;          // PHASES is the base game exactly
 static float g_offset     = 0.0f;       // rotates the cycle, 0..1 of a cycle
 static int   g_fade       = 1;
 static int   g_probe      = 0;
-static int   g_slow       = SLOW_WORLD;
+static int   g_slow       = SLOW_CALENDAR;
 
 // How many times longer a calendar day lasts than the base game's. 0 means
 // `auto`: PHASES / cycle_days, which is the value that leaves one whole
@@ -328,7 +332,9 @@ static float g_fadeLen    = VANILLA_FADE;
 // exactly 0.0f - and the weather roll and the overcast timer both key on it.
 static int   g_lastPhase  = -1;
 
-// What the day timer was left at last tick, for SLOW_CALENDAR only.
+// What the day timer was left at last tick, for SLOW_CALENDAR: both for
+// shrinking what gets displayed and for recovering the true, un-slowed delta
+// the day tick added this frame. See SlowTheCalendar.
 static float g_written    = -1.0f;
 
 static unsigned  g_ticks       = 0;
@@ -346,6 +352,7 @@ static int       g_phasesInDay = 0;
 typedef void  (*t_WeatherTick)(void* world, char fresh);
 typedef float (*t_LightFactor)(void* world);
 typedef char  (*t_SnowSeason)(void* world);
+typedef void  (*t_DailyPass)(void* world);
 
 // float C3D_TIMER::Power*(float v, bool ignorePause, bool realTime) - rcx is
 // `this`, xmm1 the value, r8b and r9b the two flags. One shape for all three.
@@ -362,11 +369,43 @@ static t_Power o_PowerKmh;
 // The one timer the simulation is integrated from, and what its game-time
 // answers are divided by. Both are written once, before any hook is installed.
 static void*  g_simTimer = 0;
-static float  g_simDiv   = 1.0f;
+
+// `slow = world`'s own contribution - day_scale when that mode is active, 1.0
+// otherwise. Kept separate from vehicle_scale/sim_scale below because the two
+// compose: `slow = world` plus a vehicle_scale of your own multiplies them,
+// which is exactly "start from the uniform trade-off, then correct vehicles
+// further" rather than two competing sources of truth.
+static float  g_simDiv      = 1.0f;
+
+// Independent of `slow` and `day_scale` entirely, and always available: two
+// separate multipliers over the same three C3D_TIMER::Power* the clock-scale
+// mechanism already hooks. `PowerKmh` is used for nothing but converting a
+// vehicle's speed into distance, at every site checked - vehicle+0x1708 or an
+// adjacent vehicle-record field appears at every call - so it is a clean,
+// single-purpose lever. `Power` and `PowerTime` are not: between them they
+// cover camera zoom, UI axes (all with realTime=true and therefore already
+// excluded), building rotation, and - the part this exists for - walking,
+// construction and production, all sharing the same two imports with no
+// narrower distinction the executable itself draws. So `sim_scale` is
+// necessarily "everything but vehicles and the calendar" as one dial, not
+// "just walking" - see daynight.ini for the full explanation of why a finer
+// split was not attempted.
+static float g_vehicleScale = 1.0f;
+static float g_simScale     = 1.0f;
+
+// The three daily passes - resolved and called directly, like g_SnowSeason.
+// Only meaningful in `slow = calendar`.
+static t_DailyPass g_DailyPollution;
+static t_DailyPass g_DailyLoans;
+static t_DailyPass g_DailyNotices;
+
+// The true, un-slowed time accumulated since the last daily-pass catch-up, in
+// the day tick's own units (0..g_dayLen). See DriveDailyPasses.
+static float g_dailyAccum = 0.0f;
 
 // Cleared for good the first time reading the season faults, which can only
-// happen if 0x334340's globals are not up yet. The date then falls back to the
-// nearest representative, which is what version 1.x always used.
+// happen if the season test's globals are not up yet. The date then falls back
+// to the nearest representative, which is what version 1.x always used.
 static int    g_seasonSafe = 1;
 
 // The light factor's stand-in object. Thread local and zero initialised once,
@@ -379,32 +418,83 @@ static __declspec(thread) BYTE t_season[SEASON_SCRATCH];
 
 // -------------------------------------------------------- the clock scale
 //
-// One wrapper per imported Power*, and they are deliberately as small as they
-// look: PowerTime alone is called thousands of times a frame.
+// Installed whenever any of `slow = world`, vehicle_scale or sim_scale asks
+// for it - see NeedClockHooks. One wrapper per imported Power*, and they are
+// deliberately as small as they look: PowerTime alone is called thousands of
+// times a frame.
 //
 // `realTime` true means the caller asked for wall-clock time on purpose - the
 // callee divides by this[4], the unscaled frame rate, instead of this[0]. Those
 // callers are the ones that must keep running at full speed whatever the game
 // speed is, so they are passed through untouched.
+//
+// `g_simDiv` is `slow = world`'s contribution (1.0 unless that mode is active);
+// `g_simScale`/`g_vehicleScale` are the independent, always-available dials.
+// They multiply rather than compete: `slow = world` plus your own
+// vehicle_scale stacks the uniform trade-off with a further correction on top
+// of it.
 
 static float h_Power(void* self, float v, char ignorePause, char realTime)
 {
     float r = o_Power(self, v, ignorePause, realTime);
-    if (!realTime && self == g_simTimer) r /= g_simDiv;
+    if (!realTime && self == g_simTimer) r /= (g_simDiv * g_simScale);
     return r;
 }
 
 static float h_PowerTime(void* self, float v, char ignorePause, char realTime)
 {
     float r = o_PowerTime(self, v, ignorePause, realTime);
-    if (!realTime && self == g_simTimer) r /= g_simDiv;
+    if (!realTime && self == g_simTimer) r /= (g_simDiv * g_simScale);
     return r;
 }
+
+// Temporary: which functions call PowerKmh on the shared timer, the way
+// `ResourceGet` was originally mapped by logging every (name, result) pair
+// rather than guessing from disassembly - see docs/03-reverse-engineering.md.
+// A vehicle window reported showing a scaled "Maximum speed" figure. The
+// window's own drawing code was checked first and does not call Power/
+// PowerTime/PowerKmh at all, so whatever it displays has to be a plain field
+// - either genuinely unaffected, or written earlier by one of PowerKmh's real
+// callers and read back later. The first round only caught the vehicle
+// standing still (every v was 0), so this round samples a few *nonzero*
+// calls per caller instead of stopping at the first sighting - moving values
+// are what settles whether a given site's arithmetic could plausibly be
+// feeding that field. Removed once the caller is identified.
+#define KMH_MAX_CALLERS 16
+#define KMH_SAMPLES_EACH 4
+static void* g_kmhCaller[KMH_MAX_CALLERS];
+static int   g_kmhSamples[KMH_MAX_CALLERS];
+static int   g_kmhCallerCount = 0;
 
 static float h_PowerKmh(void* self, float v, char ignorePause, char realTime)
 {
     float r = o_PowerKmh(self, v, ignorePause, realTime);
-    if (!realTime && self == g_simTimer) r /= g_simDiv;
+    if (!realTime && self == g_simTimer)
+    {
+        if (g_probe && (v > 0.0001f || v < -0.0001f))
+        {
+            void* caller = _ReturnAddress();
+            int idx = -1;
+            for (int i = 0; i < g_kmhCallerCount; i++)
+                if (g_kmhCaller[i] == caller) { idx = i; break; }
+            if (idx < 0 && g_kmhCallerCount < KMH_MAX_CALLERS)
+            {
+                idx = g_kmhCallerCount++;
+                g_kmhCaller[idx]  = caller;
+                g_kmhSamples[idx] = 0;
+            }
+            if (idx >= 0 && g_kmhSamples[idx] < KMH_SAMPLES_EACH)
+            {
+                g_kmhSamples[idx]++;
+                Logf("daynight  PowerKmh probe: caller +0x%llX  v=%.4f -> %.4f scaled "
+                     "(%.4f unscaled)  [sample %d/%d]",
+                     (unsigned long long)((BYTE*)caller - g_exeBase), v,
+                     r / (g_simDiv * g_vehicleScale), r,
+                     g_kmhSamples[idx], KMH_SAMPLES_EACH);
+            }
+        }
+        r /= (g_simDiv * g_vehicleScale);
+    }
     return r;
 }
 
@@ -482,14 +572,15 @@ static int Candidates(int day, int k, int* out, int max)
 //
 // Without the second condition a single calendar day sweeps a thirteen-day
 // window over the date, and near a boundary that window straddles it: the
-// weather then flips in and out of winter thirteen times a day. Every season in
-// 0x334340 is at least a hundred days long and the representatives are thirteen
-// apart, so a matching one always exists.
+// weather then flips in and out of winter thirteen times a day. Every season is
+// at least a hundred days long and the representatives are thirteen apart, so a
+// matching one always exists.
 //
 // The test is asked on a **scratch object of the plugin's own**, the same trick
-// the light factor uses: 0x334340's 120 bytes reference their argument exactly
-// twice and both are `[arg+0x590]`, everything else being an absolute global.
-// So the world object is never written to answer a question about it.
+// the light factor uses: the season test's 120-ish bytes reference their
+// argument exactly twice and both are `[arg+0x590]`, everything else being an
+// absolute global. So the world object is never written to answer a question
+// about it.
 static int PickDay(int day, int k)
 {
     int cand[8];
@@ -525,25 +616,89 @@ static int PickDay(int day, int k)
 
 // ------------------------------------------------------- SLOW_CALENDAR only
 //
-// Version 1.x's day stretch, kept because it is the control that reproduces the
-// bugs version 2.0 fixes and nothing else will. It gives back most of what the
-// day tick just added to +0x59C, which slows the calendar and NOTHING ELSE -
-// see the header. `raw` below the last written value means the day tick rolled
-// the field over and a new day has started.
-static float SlowTheCalendar(BYTE* world)
+// Slows the calendar day and nothing else: movement, vehicles, construction
+// and every other per-frame rate keep the base game's own pace, because
+// nothing here touches C3D_TIMER. It gives back most of what the day tick just
+// added to +0x59C. The field stays on its own 0..60, so the rollover test and
+// every +0x59C/60 the engine computes elsewhere stay exactly right.
+//
+// `outDelta` is the true, un-slowed time the day tick added this frame -
+// `raw - g_written` when the day did not roll over, or the wrapped amount when
+// it did. `outRolled` says whether the day tick's own rollover branch ran this
+// frame - both feed DriveDailyPasses, which is what keeps pollution, loans and
+// notifications off version 1.x's desync.
+static float SlowTheCalendar(BYTE* world, float* outDelta, bool* outRolled)
 {
     float raw = *(float*)(world + OFF_DAYTIME);
+
+    if (g_written < 0.0f)
+    {
+        // The first tick of a session: the field came out of the save and none
+        // of it is this tick's advance, so there is no delta to account for.
+        g_written  = raw;
+        *outDelta  = 0.0f;
+        *outRolled = false;
+        return raw;
+    }
+
+    bool rolled = raw < g_written;
+    *outDelta  = rolled ? (g_dayLen - g_written) + raw : raw - g_written;
+    *outRolled = rolled;
+
     float out = raw;
-
-    if (g_written < 0.0f) { g_written = raw; return raw; }
-
-    if (g_dayScale > 1.0f && raw >= g_written)
+    if (!rolled && g_dayScale > 1.0f)
         out = g_written + (raw - g_written) / g_dayScale;
 
     if (out > g_dayLen) out = g_dayLen;
     *(float*)(world + OFF_DAYTIME) = out;
     g_written = out;
     return out;
+}
+
+// Runs the three real-time-integrating passes - pollution, loans, notices - at
+// the cadence the un-slowed calendar would have used, tracked independently of
+// what SlowTheCalendar leaves on display. `delta` is what the day tick truly
+// added this frame; `rolled` says its own rollover branch already fired once
+// this frame, covering one of the crossings below, which must not be paid for
+// twice.
+//
+// Bounded to MAX_CATCHUP so a long stall cannot turn into a burst of calls.
+static void DriveDailyPasses(void* world, float delta, bool rolled)
+{
+    if (!g_DailyPollution && !g_DailyLoans && !g_DailyNotices) return;
+    if (g_dayLen <= 0.0f) return;
+
+    g_dailyAccum += delta;
+
+    int crossings = 0;
+    while (g_dailyAccum >= g_dayLen && crossings < MAX_CATCHUP)
+    {
+        g_dailyAccum -= g_dayLen;
+        crossings++;
+    }
+    if (rolled && crossings > 0) crossings--;   // the day tick already paid for one
+
+    for (int i = 0; i < crossings; i++)
+    {
+        __try
+        {
+            if (g_DailyPollution) g_DailyPollution(world);
+            if (g_DailyLoans)     g_DailyLoans(world);
+            if (g_DailyNotices)   g_DailyNotices(world);
+        }
+        __except (FaultFilter("daynight daily pass", GetExceptionInformation()))
+        {
+            g_DailyPollution = 0; g_DailyLoans = 0; g_DailyNotices = 0;
+            Logf("daynight  a daily catch-up pass faulted - no longer driving them; "
+                 "pollution, loans and notices will fall back to the slowed "
+                 "calendar's own, rarer pace");
+            break;
+        }
+    }
+
+    if (g_probe && crossings > 0)
+        Logf("daynight  %d catch-up day(s) for pollution/loans/notices  "
+             "(accumulator %.2f/%.0f)", crossings, g_dailyAccum, g_dayLen);
 }
 
 // ---------------------------------------------------------------- the hooks
@@ -563,17 +718,27 @@ static void h_WeatherTick(BYTE* world, char fresh)
     // after a load has no previous one to have crossed a boundary from.
     if (fresh)
     {
-        g_lastPhase = -1;
-        g_written   = -1.0f;
+        g_lastPhase  = -1;
+        g_written    = -1.0f;
+        g_dailyAccum = 0.0f;
     }
 
     if (g_enabled && world)
     {
         __try
         {
-            dayWas  = *(int*)(world + OFF_DAY);
-            timeWas = (g_slow == SLOW_CALENDAR) ? SlowTheCalendar(world)
-                                                : *(float*)(world + OFF_DAYTIME);
+            dayWas = *(int*)(world + OFF_DAY);
+
+            if (g_slow == SLOW_CALENDAR)
+            {
+                float delta; bool rolled;
+                timeWas = SlowTheCalendar(world, &delta, &rolled);
+                DriveDailyPasses(world, delta, rolled);
+            }
+            else
+            {
+                timeWas = *(float*)(world + OFF_DAYTIME);
+            }
 
             float time = timeWas;
             Phase(dayWas, timeWas, &time, &phase);
@@ -620,14 +785,14 @@ static void h_WeatherTick(BYTE* world, char fresh)
         __try
         {
             // Unconditionally, including over the one write the original makes
-            // to +0x59C itself at 0x333C03. That write zeroes the *calendar
-            // day timer* when the weather changes under the editor flag at
-            // +0x1090 - harmless when a phase was a day, and a lost day now.
+            // to +0x59C itself. That write zeroes the *calendar day timer* when
+            // the weather changes under the editor flag at +0x1090 - harmless
+            // when a phase was a day, and a lost day now.
             *(int*)  (world + OFF_DAY)     = dayWas;
             *(float*)(world + OFF_DAYTIME) = timeWas;
 
-            // 0x333F80 has just written a fixed 15.0f in here if the weather
-            // changed. A phase is shorter now, so the fade has to be.
+            // The weather-change code has just written a fixed 15.0f in here if
+            // the weather changed. A phase is shorter now, so the fade has to be.
             if (g_fade) *(float*)(world + OFF_FADE_LEN) = g_fadeLen;
         }
         __except (FaultFilter("daynight restore", GetExceptionInformation()))
@@ -677,10 +842,10 @@ static void h_WeatherTick(BYTE* world, char fresh)
 
             if ((++g_ticks & 0xFF) == 0)
                 Logf("daynight  probe day %3d  t %6.2f/%.0f  phase %2d  weather %d  "
-                     "night %.3f  fade %.2f/%.2f  sim clock /%.2f",
+                     "night %.3f  fade %.2f/%.2f  sim clock /%.2f  daily accum %.2f",
                      dayWas, timeWas, g_dayLen, phase, weather, night,
                      *(float*)(world + OFF_FADE_ELAPSED),
-                     *(float*)(world + OFF_FADE_LEN), g_simDiv);
+                     *(float*)(world + OFF_FADE_LEN), g_simDiv, g_dailyAccum);
         }
         __except (FaultFilter("daynight probe", GetExceptionInformation())) { }
     }
@@ -737,12 +902,12 @@ static void ReadSettings()
     if (H->configString(ini, "daynight", "offset", v, sizeof(v), "") && v[0])
         g_offset = (float)atof(v);
 
-    if (H->configString(ini, "daynight", "slow", v, sizeof(v), "world") && v[0])
+    if (H->configString(ini, "daynight", "slow", v, sizeof(v), "calendar") && v[0])
     {
         Trim(v);
-        if      (_stricmp(v, "none")     == 0) g_slow = SLOW_NONE;
-        else if (_stricmp(v, "calendar") == 0) g_slow = SLOW_CALENDAR;
-        else                                   g_slow = SLOW_WORLD;
+        if      (_stricmp(v, "none")  == 0) g_slow = SLOW_NONE;
+        else if (_stricmp(v, "world") == 0) g_slow = SLOW_WORLD;
+        else                                 g_slow = SLOW_CALENDAR;
     }
 
     if (g_cycleDays < 1)            g_cycleDays = 1;
@@ -766,6 +931,29 @@ static void ReadSettings()
     if (g_dayScale > 100.0f) g_dayScale = 100.0f;
 
     if (g_slow == SLOW_NONE) g_dayScale = 1.0f;
+
+    // Independent of `slow` and `day_scale` entirely - unlike the day, these
+    // are allowed to go either way: > 1 slower, < 1 faster, which is what
+    // rebalancing vehicles against pedestrians actually needs.
+    g_vehicleScale = 1.0f;
+    if (H->configString(ini, "daynight", "vehicle_scale", v, sizeof(v), "1") && v[0])
+        g_vehicleScale = (float)atof(v);
+    if (g_vehicleScale < 0.1f) g_vehicleScale = 0.1f;
+    if (g_vehicleScale > 10.0f) g_vehicleScale = 10.0f;
+
+    g_simScale = 1.0f;
+    if (H->configString(ini, "daynight", "sim_scale", v, sizeof(v), "1") && v[0])
+        g_simScale = (float)atof(v);
+    if (g_simScale < 0.1f) g_simScale = 0.1f;
+    if (g_simScale > 10.0f) g_simScale = 10.0f;
+}
+
+// Whether anything needs the shared C3D_TIMER touched at all - `slow = world`,
+// or either of the two independent dials away from their 1.0 default.
+static bool NeedClockHooks()
+{
+    return (g_dayScale > 1.0f && g_slow == SLOW_WORLD) ||
+           g_vehicleScale != 1.0f || g_simScale != 1.0f;
 }
 
 // Reads the two constants this plugin scales against out of the executable
@@ -801,10 +989,9 @@ static bool ReadConstants()
 
     // The same fraction of a phase the base game used: a quarter of it. The
     // day scale belongs in here because the cross-fade's own clock is not the
-    // simulation one - 0x8F50 accumulates +0xED0 from the timer at 0xA558A0,
-    // which this plugin does not slow - so a phase lasts `day_scale` times
-    // longer in the units the fade is measured in. With `day_scale = auto` the
-    // two cancel and the answer is the vanilla 15 again.
+    // simulation one, so a phase lasts `day_scale` times longer in the units
+    // the fade is measured in. With `day_scale = auto` the two cancel and the
+    // answer is the vanilla 15 again.
     g_fadeLen = fade * (float)g_cycleDays * g_dayScale / (float)PHASES;
     return true;
 }
@@ -826,6 +1013,35 @@ static void ResolveSeason()
          "be the nearest one, and winter may start a few days out", RVA_SNOW_SEASON);
 }
 
+// The three daily-pass functions, resolved by prologue the same way. Any that
+// fails to match is simply not driven - DriveDailyPasses skips whichever of
+// the three it does not have, so a mismatch degrades to "that one system runs
+// at the slowed calendar's own rate" rather than refusing the whole plugin.
+static void ResolveDailyPasses()
+{
+    const BYTE* pol  = g_exeBase + RVA_DAILY_POLLUTION;
+    const BYTE* loan = g_exeBase + RVA_DAILY_LOANS;
+    const BYTE* note = g_exeBase + RVA_DAILY_NOTICES;
+
+    if (memcmp(pol, kDailyPollutionSig, sizeof(kDailyPollutionSig)) == 0)
+        g_DailyPollution = (t_DailyPass)pol;
+    else
+        Logf("daynight  rva 0x%X is not the pollution pass - it will decay at the "
+             "slowed calendar's own rate, same as version 1.x", RVA_DAILY_POLLUTION);
+
+    if (memcmp(loan, kDailyLoansSig, sizeof(kDailyLoansSig)) == 0)
+        g_DailyLoans = (t_DailyPass)loan;
+    else
+        Logf("daynight  rva 0x%X is not the loan pass - loans will barely move, "
+             "same as version 1.x", RVA_DAILY_LOANS);
+
+    if (memcmp(note, kDailyNoticesSig, sizeof(kDailyNoticesSig)) == 0)
+        g_DailyNotices = (t_DailyPass)note;
+    else
+        Logf("daynight  rva 0x%X is not the notification pass - offers and notices "
+             "will linger", RVA_DAILY_NOTICES);
+}
+
 // Proves that 0x9D4EE0 is the C3D_TIMER the calendar is driven from, out of the
 // day tick's own call to PowerTime on it:
 //
@@ -836,6 +1052,7 @@ static void ResolveSeason()
 //
 // Both displacements are resolved and compared rather than matched as bytes,
 // so this survives the executable moving and refuses if anything else does.
+// `slow = world` only.
 static bool VerifySimTimer()
 {
     const BYTE* p = g_exeBase + RVA_DAYTICK_POWER;
@@ -875,7 +1092,8 @@ static bool VerifySimTimer()
 
 // Every Power* the executable imports, or none of them: scaling the time but
 // not the vehicle speeds would be a worse desynchronisation than the one this
-// is here to remove.
+// is here to remove. Installed for `slow = world`, for vehicle_scale, for
+// sim_scale, or any combination - see NeedClockHooks.
 static bool ScaleSimClock()
 {
     if (!VerifySimTimer()) return false;
@@ -890,7 +1108,7 @@ static bool ScaleSimClock()
     }
 
     g_simTimer = g_exeBase + RVA_SIM_TIMER;
-    g_simDiv   = g_dayScale;
+    g_simDiv   = (g_slow == SLOW_WORLD) ? g_dayScale : 1.0f;
 
     bool ok = PatchIat(g_exe, DLL_ENGINE, SYM_POWERTIME, (void*)h_PowerTime,
                        (void**)&o_PowerTime, "C3D_TIMER::PowerTime");
@@ -923,7 +1141,7 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
 {
     TsmBind(host);
     info->name    = "daynight";
-    info->version = "2.0";
+    info->version = "2.1";
 
     ReadSettings();
     if (!g_enabled)
@@ -960,55 +1178,85 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         return 1;
     }
 
-    if (g_cycleDays == PHASES && g_offset == 0.0f && g_dayScale == 1.0f)
+    // The shared clock is touched at most once, regardless of how many of
+    // `slow = world`, vehicle_scale and sim_scale are asking for it - the
+    // messages below all read off this single, already-known result rather
+    // than each calling ScaleSimClock (and re-logging its hook attempts)
+    // separately.
+    bool needClock = NeedClockHooks();
+    bool clockOk   = needClock ? ScaleSimClock() : true;
+    if (needClock && !clockOk)
     {
+        g_vehicleScale = 1.0f;
+        g_simScale     = 1.0f;
+    }
+
+    bool calendarIsIdentity = (g_cycleDays == PHASES && g_offset == 0.0f && g_dayScale == 1.0f);
+    if (calendarIsIdentity)
         Logf("daynight  cycle_days = %d, day_scale = 1 is the base game - hooked, "
-             "changes nothing", PHASES);
-        return 0;
-    }
-
-    Logf("daynight  one day/night cycle every %d calendar day(s): "
-         "%.2f day units per phase, %.2f of them a fade",
-         g_cycleDays, (float)g_cycleDays * g_dayLen / (float)PHASES,
-         g_fade ? g_fadeLen : VANILLA_FADE);
-
-    if (g_dayScale > 1.0f && g_slow == SLOW_WORLD)
-    {
-        if (ScaleSimClock())
-            Logf("daynight  the whole simulation clock is scaled %.2fx, so a calendar "
-                 "day lasts %.2fx longer and the cycle runs at %.2fx the base game's "
-                 "pace. EVERY rate in the game slows with it, in step - production, "
-                 "wages, pollution, loans - so the economy is the base game's, only "
-                 "%.2fx slower in real time. Raising the game speed cancels it exactly",
-                 g_dayScale, g_dayScale,
-                 (float)g_cycleDays * g_dayScale / (float)PHASES, g_dayScale);
-        else
-            Logf("daynight  the simulation clock could not be scaled - the cycle now "
-                 "fits in one in-game day, a few seconds of real time, and is too fast "
-                 "to watch. Nothing else is affected");
-    }
-    else if (g_dayScale > 1.0f && g_slow == SLOW_CALENDAR)
-    {
-        Logf("daynight  slow = calendar: the CALENDAR ALONE is stretched %.2fx and "
-             "nothing else is. THIS IS VERSION 1.x AND IT IS KNOWN BROKEN - pollution "
-             "runs away, winter starves the cities and loans never repay, because "
-             "everything per game-day slows while everything per frame does not. It "
-             "is here to reproduce those, not to play with", g_dayScale);
-    }
+             "changes nothing to the calendar", PHASES);
     else
     {
-        Logf("daynight  calendar day left at its own length, so the whole cycle now "
-             "fits in one in-game day - a few seconds of real time. Set day_scale "
-             "= auto if that is too fast to see");
+        Logf("daynight  one day/night cycle every %d calendar day(s): "
+             "%.2f day units per phase, %.2f of them a fade",
+             g_cycleDays, (float)g_cycleDays * g_dayLen / (float)PHASES,
+             g_fade ? g_fadeLen : VANILLA_FADE);
+
+        if (g_dayScale > 1.0f && g_slow == SLOW_CALENDAR)
+        {
+            ResolveDailyPasses();
+            Logf("daynight  calendar stretched %.2fx and NOTHING ELSE IS - walking, "
+                 "vehicles, construction and production keep the base game's own "
+                 "pace. Pollution decay, loan repayment and notification expiry are "
+                 "driven directly at the un-slowed rate so they do not fall behind "
+                 "the per-frame systems they balance (%s%s%s)",
+                 g_dayScale,
+                 g_DailyPollution ? "pollution ok" : "pollution NOT DRIVEN",
+                 g_DailyLoans     ? ", loans ok"   : ", loans NOT DRIVEN",
+                 g_DailyNotices   ? ", notices ok" : ", notices NOT DRIVEN");
+        }
+        else if (g_dayScale > 1.0f && g_slow == SLOW_WORLD)
+        {
+            if (clockOk)
+                Logf("daynight  slow = world: the whole simulation clock is scaled "
+                     "%.2fx along with the calendar, so a day lasts %.2fx longer and "
+                     "the cycle runs at %.2fx the base game's pace. EVERY rate in the "
+                     "game slows with it, in step - including walking, vehicles and "
+                     "construction",
+                     g_dayScale, g_dayScale, (float)g_cycleDays * g_dayScale / (float)PHASES);
+            else
+                Logf("daynight  slow = world could not scale the clock - the cycle now "
+                     "fits in one in-game day, a few seconds of real time, and nothing "
+                     "else is affected");
+        }
+        else
+        {
+            Logf("daynight  calendar day left at its own length, so the whole cycle now "
+                 "fits in one in-game day - a few seconds of real time. Set day_scale "
+                 "= auto if that is too fast to see");
+        }
+
+        if (g_offset != 0.0f)
+            Logf("daynight  cycle rotated by %.3f of itself", g_offset);
+        if (!g_fade)
+            Logf("daynight  cross-fade left at %.0f - it may not finish inside a phase",
+                 VANILLA_FADE);
+        if (!g_SnowSeason)
+            Logf("daynight  no season test - the weather may change season a few days off");
     }
 
-    if (g_offset != 0.0f)
-        Logf("daynight  cycle rotated by %.3f of itself", g_offset);
-    if (!g_fade)
-        Logf("daynight  cross-fade left at %.0f - it may not finish inside a phase",
-             VANILLA_FADE);
-    if (!g_SnowSeason)
-        Logf("daynight  no season test - the weather may change season a few days off");
+    // vehicle_scale and sim_scale are independent of everything above.
+    if (clockOk && g_vehicleScale != 1.0f)
+        Logf("daynight  vehicle_scale %.2fx - vehicle speed only, independent of "
+             "walking, production and the calendar", g_vehicleScale);
+    if (clockOk && g_simScale != 1.0f)
+        Logf("daynight  sim_scale %.2fx - everything the shared clock drives except "
+             "vehicles: walking, construction, production, animation. Independent of "
+             "the calendar and of vehicle_scale", g_simScale);
+    if (!clockOk && needClock && !(g_dayScale > 1.0f && g_slow == SLOW_WORLD))
+        Logf("daynight  the simulation clock could not be scaled - vehicle_scale and "
+             "sim_scale are not applied");
+
     return 0;
 }
 

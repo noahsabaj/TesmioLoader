@@ -1,5 +1,13 @@
 # easystart — needs that arrive with the century
 
+> Every address here is for **SOVIET64.exe v1.1.1.9** (`TimeDateStamp`
+> `0x6A3EB6AD`). Version 1.0 of this plugin was derived against v1.1.1.7 while
+> that build was still on disk, and every code address in it was wrong by
+> `+0x70`, `+0xA0` or `+0x1E0` once Steam updated the game. `.data` did not
+> move — the two reason ledgers are at the same place in both builds — and
+> `.rdata`'s float pool moved by `-0x18`. See
+> [07-pitfalls.md](07-pitfalls.md), *Check the build before you read the exe*.
+
 A map that starts pre-populated hands the player a town whose citizens want
 electricity, running water, central heating and a cinema on the first day. They
 lived without all of it the day before. `easystart` holds each need back until a
@@ -32,28 +40,28 @@ every reason to the code that raises it. That scan is the map of the feature:
 
 | # | Happiness reason | Raised by | Gated as |
 |---|---|---|---|
-| 0 | Starving | `0x83A4F0` | `food` |
-| 1 | Lack of meat | `0x83A4F0` | `meat` |
-| 2 | Unable to get clothes | `0x83A4F0`, `0x836960` | `clothes` |
-| 3 | Unable to get electronics | `0x83A4F0` | `electronics` |
+| 0 | Starving | `0x83A6D0` | `food` |
+| 1 | Lack of meat | `0x83A6D0` | `meat` |
+| 2 | Unable to get clothes | `0x83A6D0`, `0x836960` | `clothes` |
+| 3 | Unable to get electronics | `0x83A6D0` | `electronics` |
 | 4 | Job | **nobody** — dead in this build | — |
-| 5 | No electricity | `0x1BC1A0` | `electricity` |
-| 6 | No water | `0x1BC1A0` | `water` |
-| 7 | Crime | `0x256010`, `0x257170` | — |
-| 8 | Interior temperature | `0x488AE0` | `heating` |
-| 9 | TV or radio broadcast | `0x4C2150` | — (a bonus only) |
+| 5 | No electricity | `0x1BC210` | `electricity` |
+| 6 | No water | `0x1BC210` | `water` |
+| 7 | Crime | `0x256080`, `0x2571E0` | — |
+| 8 | Interior temperature | `0x488B80` | `heating` |
+| 9 | TV or radio broadcast | `0x4C21F0` | — (a bonus only) |
 | 10…14 | prison, orphanage, a child's death, relocation, expulsion | events | — |
-| 15 | Low government loyalty | `0x83A4F0` | — |
-| 16 | Unable to visit a hospital | `0x83A4F0` | `health` |
-| 17 | Unable to drink alcohol | `0x83A4F0` | `alcohol` |
-| 18 | Unable to practice sports | `0x83A4F0` | `sport` |
-| 19 | Unable to pray in church | `0x83A4F0` | `religion` |
-| 20 | Unable to enjoy culture | `0x83A4F0` | `culture` |
+| 15 | Low government loyalty | `0x83A6D0` | — |
+| 16 | Unable to visit a hospital | `0x83A6D0` | `health` |
+| 17 | Unable to drink alcohol | `0x83A6D0` | `alcohol` |
+| 18 | Unable to practice sports | `0x83A6D0` | `sport` |
+| 19 | Unable to pray in church | `0x83A6D0` | `religion` |
+| 20 | Unable to enjoy culture | `0x83A6D0` | `culture` |
 | 21, 22 | prison / orphanage upbringing | events | — |
 
 and on the health side: Starving, Pollution, Stroke, Unable to visit doctor,
 Drinking alcohol, Burns from fire, **Insufficient or polluted drinking water**
-(`0x1B08E0`), Crime, **Low interior temperature** (`0x488AE0`), Ambulance delay,
+(`0x1B0950`), Crime, **Low interior temperature** (`0x488B80`), Ambulance delay,
 Global pandemic, Lack of meat.
 
 Two things fall out of the table and both matter:
@@ -67,11 +75,11 @@ Two things fall out of the table and both matter:
 ## Nine needs, one function, no code patch
 
 ```
-rva 0x83A4F0   FUN(game, person)
+rva 0x83A6D0   FUN(game, person)
 ```
 
-One caller, `0x8338E0`, inside the per-person tick `0x832CB0` and immediately
-after that tick has run the daily planner. It walks the demand array the planner
+One caller, inside the per-person tick, immediately after that tick has run
+the daily planner. It walks the demand array the planner
 has just rebuilt, moves `person+0xD8` (happiness) and `person+0xE0` (health), and
 attributes each change. Which reason is decided by two fields and nothing else:
 
@@ -141,11 +149,11 @@ matching on the same kind and record the demand carries — the entries are
 Electricity, water and interior temperature never reach a demand array. Three
 building functions subtract from every inhabitant directly:
 
-| Function | Root | What |
-|---|---|---|
-| `0x1BC1A0` | living tick | happiness: *No electricity*, *No water* |
-| `0x488AE0` | interior temperature | happiness **and** health |
-| `0x1B08E0` | drinking water | health |
+| Function | What |
+|---|---|
+| `0x1BC210` | the living tick — happiness: *No electricity*, *No water* |
+| `0x488B80` | interior temperature — happiness **and** health |
+| `0x1B0950` | drinking water — health |
 
 Every one has the same shape. The amount is computed **once, before the loop over
 the inhabitants**, scaled by the "Unsatisfied citizens reaction" setting at
@@ -167,82 +175,111 @@ the counter is skipped, which is exactly what a need that does not exist yet
 should look like in the statistics window.
 
 Each amount is finalised by one rip-relative load of a `.rdata` constant, so the
-whole patch is twelve rewritten displacements — no hook, no code cave, and the
-same technique `walking` uses:
+whole patch is twelve rewritten displacements — no hook, no code cave:
 
 | Site | Instruction | Constant | Value | Need |
 |---|---|---|---|---|
-| `0x1BC32B` | `mulsd xmm1,[rip]` | `0x909E50` | 0.000216667 (double) | electricity |
-| `0x1BC505` | `mulsd xmm1,[rip]` | `0x909E78` | 0.000333333 (double) | electricity |
-| `0x1BC6DB` | `mulss xmm3,[rip]` | `0x909B10` | 0.001 | water |
-| `0x488B4A` | `movss xmm7,[rip]` | `0x909B30` | 0.0015 | heating, happiness |
-| `0x488B7C` | `movss xmm7,[rip]` | `0x909B1C` | 0.00117 | heating, happiness |
-| `0x488B66` | `movss xmm8,[rip]` | `0x909B38` | 0.0017 | heating, health |
-| `0x488B84` | `movss xmm8,[rip]` | `0x909B28` | 0.001326 | heating, health |
-| `0x1B0AC7` | `mulss xmm2,[rip]` | `0x909AD4` | 0.00025 | water, health |
-| `0x1B0AD4` | `mulss xmm0,[rip]` | `0x909ADC` | 0.0003125 | water, health |
-| `0x1B1193` | `mulss xmm1,[rip]` | `0x909AC0` | 0.0001875 | water, health |
-| `0x1B11A3` | `mulss xmm1,[rip]` | `0x909AD4` | 0.00025 | water, health |
-| `0x1B11B3` | `mulss xmm1,[rip]` | `0x909ADC` | 0.0003125 | water, health |
+| `0x1BC39B` | `mulsd xmm1,[rip]` | `0x909E38` | 0.000216667 (double) | electricity |
+| `0x1BC575` | `mulsd xmm1,[rip]` | `0x909E60` | 0.000333333 (double) | electricity |
+| `0x1BC74B` | `mulss xmm3,[rip]` | `0x909AF8` | 0.001 | water |
+| `0x488BEA` | `movss xmm7,[rip]` | `0x909B18` | 0.0015 | heating, happiness |
+| `0x488C1C` | `movss xmm7,[rip]` | `0x909B04` | 0.00117 | heating, happiness |
+| `0x488C06` | `movss xmm8,[rip]` | `0x909B20` | 0.0017 | heating, health |
+| `0x488C24` | `movss xmm8,[rip]` | `0x909B10` | 0.001326 | heating, health |
+| `0x1B0B37` | `mulss xmm2,[rip]` | `0x909ABC` | 0.00025 | water, health |
+| `0x1B0B44` | `mulss xmm0,[rip]` | `0x909AC4` | 0.0003125 | water, health |
+| `0x1B1203` | `mulss xmm1,[rip]` | `0x909AA8` | 0.0001875 | water, health |
+| `0x1B1213` | `mulss xmm1,[rip]` | `0x909ABC` | 0.00025 | water, health |
+| `0x1B1223` | `mulss xmm1,[rip]` | `0x909AC4` | 0.0003125 | water, health |
 
 Two per need where the game has two branches: heating splits warm/cold, and
-electricity splits on how the shortfall is measured. `0x1B0AD4` is a *bonus* term
-for clean water rather than a penalty, and it is zeroed too — a need that does
-not exist must not pay either way.
+electricity splits on how the shortfall is measured. `0x1B0B44` is a *bonus*
+term for clean water rather than a penalty, and it is zeroed too — a need that
+does not exist must not pay either way.
 
 **Overwriting the constants in place is the obvious alternative and is wrong for
-the usual reason:** `0x909AD4` and `0x909ADC` are each read by two different
-blocks, and the literal pool is shared. Rewriting one displacement touches
-exactly one read.
+the usual reason:** `0x909ABC` and `0x909AC4` are each read by two different
+blocks, and the literal pool is shared.
 
-Each slot holds the vanilla value until the first tick reports a year, so a
-plugin that has not decided anything yet is bit for bit the base game.
+## The window counts separately, and that is a third face of the same need
 
-## School and kindergarten
+Version 1.0 gated all of the above and the building's own window still said
+
+```
+-Building is without power supply
+56 Citizen(s) currently without power
+56 Citizen(s) are currently without drinking water
+```
+
+because none of those three lines reads the happiness ledger. They are drawn by
+`0x761300`, the living building's panel, from state the simulation keeps for
+itself.
+
+**The two counted lines come from four floats the living tick snapshots** at the
+top of every pass:
+
+```
+building+0x1104 -> +0x1108      building+0x110C -> +0x1110
+building+0x1114 -> +0x1118      building+0x111C -> +0x1120
+```
+
+The panel takes `max(+0x1108, +0x1110, +0x1118)` for power (`cvttss2si` at
+`0x761FA4`) and `+0x1120` for water (`0x7620A3`). **The tick never reads the
+snapshots back** — it works from the accumulators, at `0x1BC3AB` and
+`0x1BC793` — so a post-hook on `0x1BC210` that zeroes them is invisible to the
+simulation and empties both lines. That is why the fix is one post-hook on the
+tick rather than a patch on the panel: one place, and what the window says stays
+consistent with what the building is doing.
+
+**"Building is without power supply" is a query, not a counter.** The panel
+calls `0x1BBFE0(game, building)` at `0x76147B` and tests the result with
+`test al,al`. That query has twenty callers deep in the simulation, so hooking it
+would change far more than a line of text; instead the panel's own `call rel32`
+is rewritten to a 14-byte absolute jump in a cave, which forwards to the
+original unless electricity is still locked. Every other caller is untouched.
+
+## School and kindergarten, with separate years
 
 Neither raises a happiness or a health reason, so neither is a need in the sense
-above. What they are is the game's own **Education simulation** option (language
-ids 710 Simple / 711 / 712 Complex), whose help text is precisely the two
-behaviours wanted:
+above. They are the game's own **Education simulation** option (language ids
+710 Simple / 711 / 712 Complex), whose help text is precisely the two behaviours
+wanted:
 
 > id 713 — children automatically reach basic education (no elementary schools
 > needed for new born citizens); parents can work even while their children are
 > under 6 years old (no kindergarten needed).
 
-It lives at **`game+0x5BC`**, `> 0` meaning Complex, and it is written into the
-save header by `0x42CBD0` alongside the date and the other options.
+It lives at **`game+0x5DC`**, where **`0` is Complex and `1` is Simple**, and it
+is written into the save header by `0x42CBD0` alongside the date.
 
-Setting that field to 0 is not an option: the interface reads it too, and a
-kindergarten that cannot be built is worse than one that is not needed. So the
-plugin rewrites the twelve `cmp dword ptr [reg+0x5BC], 0` sites that belong to
-the *simulation* into `cmp dword ptr [rip+ours], 0` — the same seven bytes in
-the no-REX form, one byte shorter plus a `nop` with REX.B — and leaves every
-interface site (`0x76A7B0`, `0x775180`, `0x7A4870`, `0x76B2F0`) alone:
+Writing that field directly is not an option — it is saved with the world, and
+the interface reads it — so the seven places the *simulation* tests it are
+rewritten to `cmp dword ptr [rip+ours], imm8`. That is the same seven bytes in
+the plain form and eight (seven plus a `nop`) with a SIB byte; **each site keeps
+its own immediate**, because two of them compare against 1 rather than 0.
 
-```
-0x1A9CF0 0x1A9D60 0x1A9DD0   a workplace requires basic education
-0x1AA03F                     the wrapper that picks between them
-0x1A772A                     a workplace's own education demand
-0x1AD827                     productivity from education
-0x3BB29A                     the same test, from a person
-0x831A23                     a school/university workplace check
-0x822FDE 0x823129            a new citizen's education at birth
-0x825FD4 0x8260C6            the job search's education filter
-```
+And because the sites divide cleanly, the two get separate years:
 
-The flag mirrors the player's own choice once the year arrives, and is 0 before
-it; it starts at 0, so the one tick before the first year is read behaves as
-Simple rather than as Complex.
+| Group | Site | What it does |
+|---|---|---|
+| `school` | `0x823AE9` | Simple → a newborn is given basic education outright |
+| | `0x824116`, `0x824145` | Complex → education starts near zero and the child is enrolled |
+| | `0x834D65` | Simple → an arriving citizen is given education |
+| | `0x7618E7` | the panel's *"N Children can't go to school"* |
+| `kindergarten` | `0x824AEB` | a parent of a child under six searching the walking connections for a place; failing, it writes `person+0x2E = 1` at `0x824C2E` and the parent stays home |
+| | `0x761928` | the panel's *"N Workers can't work because all kindergartens…"* |
 
-**`education` is one key and it is off by default**, for two honest reasons:
+Five further readers — three in the statistics window (`0x8BB2A`, `0x8BDAE`,
+`0x8BF8D`), one in the renderer (`0x326A50`) and one in the editor
+(`0x382A8B`) — are deliberately left alone, and so is every place the build menu
+looks, which is why a kindergarten stays buildable in a year that does not need
+one yet.
 
-- **School and kindergarten cannot yet be given different years.** The site that
-  blocks a parent of a young child has not been told apart from the ones that
-  test a workplace's required education level; all twelve above test
-  `building+0x604`, the required education, or a person's own. Splitting the two
-  needs that site found first.
-- **The claim that the build menu stays available has not been watched in
-  game.** It follows from the site list, not from observation.
+Two things fell out of reading that code and are worth keeping:
+**`person+0xA8` is `fEducation`**, the 0..3 level the script API declares, and
+**`person+0xD4` is the age in years** — it is what `6.0f` is compared against at
+`0x824B06`, and it is the field the panel averages into "Average age". That is
+the field `plugins/aging` was written to go looking for.
 
 ## Settings
 
@@ -253,6 +290,7 @@ Simple rather than as Complex.
 | `enabled` | 1 | |
 | `demands` | 1 | the nine demand-carried needs |
 | `utilities` | 1 | electricity, water, heating |
+| `warnings` | 1 | the three lines the building's own window prints |
 | `pin_status` | 1 | hold a locked need's status float |
 | `locked_status` | 1.0 | at what level |
 | `clear_unsatisfied` | 1 | drop locked needs out of `person+0x4F0` too |
@@ -270,7 +308,7 @@ culture = 1940     health   = 1940
 electricity = 1945
 water = 1950       heating  = 1950
 electronics = 1955
-education = off
+school = 1932      kindergarten = 1945
 ```
 
 `[unlock_resource]` does the same for a good `needs` added — `list` names them,
@@ -284,16 +322,23 @@ starts early — the Early Start content, or a date wound back by other means.
 
 ## Testing it
 
-Nothing here has been watched in game. The build is clean and every patch site
-is compared against this build's bytes before anything is written, which is not
-a result — see [07-pitfalls.md](07-pitfalls.md).
+**One thing here is confirmed in game and the rest is not.** Version 1.0 was
+watched in a 1920s save: every locked need's status bar read 100 %, health read
+85 % and happiness 73 % — the plugin's exact fingerprint, since those two are
+deliberately never pinned. What that session also showed is what 1.1 is for: the
+building's own window still printed *Building is without power supply*,
+*56 Citizen(s) currently without power*, *56 Citizen(s) are currently without
+drinking water*, *13 Children can't go to school* and *8 Workers can't work
+because all kindergartens…*. **None of the 1.1 work has been watched at all.**
 
 1. Tick `easystart` in the launcher. Set `probe = 1`. Load a save whose year is
    **before** some of the unlock years — winding the date back is the whole
    premise, so a 1970 save proves nothing.
-2. The log should carry, at startup, twelve `rate ... now reads ...` lines and
-   `ready: demand gate on, 12 of 12 utility rate(s)`. A `refusing` line means
-   the game moved and that rate is simply left vanilla.
+2. The log should carry, at startup, twelve `rate ... now reads ...` lines,
+   seven `edu ...` lines, and
+   `ready: demand gate on, living counters on, 12 of 12 utility rate(s)`.
+   A `refusing` line means the game moved and that one site is left vanilla —
+   which after a game update is exactly what should happen.
 3. Then, on the first tick, one line per year:
    `easystart  year 1922, still to come: meat clothes electronics alcohol ...`
    If that line never appears the hook is installed but the evaluator is not
@@ -305,7 +350,18 @@ a result — see [07-pitfalls.md](07-pitfalls.md).
    kinds 1 and 2 are the shop goods. **Two hidden out of four with nothing but
    food and meat in the list is the wrong answer** and means the resource
    comparison missed.
-5. **The point of the whole plugin** — open the statistics window's *Happiness
+5. **Open a residential building's own window**, which is where 1.0 fell down.
+   With `electricity` and `water` locked there must be no *Building is without
+   power supply*, no *N Citizen(s) currently without power* and no *N Citizen(s)
+   are currently without drinking water*. With `school` and `kindergarten`
+   locked there must be no *Children can't go to school* and no *Workers can't
+   work because all kindergartens…*, and the "Workers without job" count should
+   drop by however many parents were being held at home.
+6. **Check a kindergarten and a school are still buildable** in a locked year.
+   That is the whole reason the option is repointed per site instead of being
+   written, and it is the one claim resting on the site list rather than on
+   observation.
+7. **The point of the whole plugin** — open the statistics window's *Happiness
    change* panel. Every locked need's line must read zero. A non-zero
    "Unable to enjoy culture" while `culture` is locked means the bracket is not
    taking effect; a non-zero "No water" while `water` is locked means a rate was
