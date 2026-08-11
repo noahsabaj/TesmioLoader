@@ -227,6 +227,22 @@ static int g_probe    = 1;      // and the first half, which is what 0.1 is for
 static int g_officeRange = 10000;  // metres of reach. The point of the plugin
 static int g_officeLimit = 0;      // 0 = no cap at all
 
+// The value to hunt for in a construction office, as an int and as a float.
+//
+// This is the shortcut the office's own window handed us: it shows the
+// auto-search range as "<3,500m" with a - and a + beside it, so the range is
+// a per-office number the player already sets, and its current value is known
+// before the search starts. Searching for a value you can read off the screen
+// beats inferring one from behaviour by a wide margin.
+//
+// 0 turns the hunt off.
+static int g_probeExpect = 3500;
+
+// Report every 4-byte slot of an office that changed since the last report,
+// which is what turns a list of candidates into an answer: click the + or the
+// - in the office window and exactly one of them moves.
+static int g_probeDiff = 1;
+
 static int g_probeFrom   = 0x300;
 static int g_probeTo     = 0x1800;
 static int g_probePeriod = 5;   // seconds between reports
@@ -241,6 +257,7 @@ static int g_rdataTo   = 0x90C000;
 // ---------------------------------------------------------------- state
 
 #define MAX_OFFICES   16
+#define OFFICE_SNAP   0x1800    // bytes of an office kept for the field diff
 #define MAX_LIVE      2048      // live construction sites tracked in one report
 #define MAX_ELEMS     256       // most members a candidate list may hold
 #define MAX_TYPE      128       // histogram buckets
@@ -279,6 +296,10 @@ struct Office
     float claimedMax;
     float unclaimedMin;
     int   scanned;      // the .rdata hunt is done once per bracket, not per report
+
+    int   hunted;       // the value hunt is done once per office, not per report
+    int   haveSnap;
+    BYTE  snap[OFFICE_SNAP];
 };
 
 static Office g_office[MAX_OFFICES];
@@ -598,6 +619,81 @@ static int ScanOffice(BYTE* b, DWORD extent, BYTE** bvBegin, int bvCount,
     return found;
 }
 
+// ---------------------------------------------------------------- the hunt
+//
+// The office window shows the auto-search range outright - "<3,500m", with a
+// minus and a plus - so the range is a per-office number whose current value
+// is known before the search begins. That is a far better starting point than
+// the list scan below: instead of inferring a limit from which buildings got
+// picked up, look for the number itself.
+//
+// Reported as int and as float because either is plausible: the UI prints
+// whole metres, and this game stores distances both ways (walking's 480 is a
+// float in .rdata, its twin is an imm32).
+
+static int FindValue(BYTE* obj, DWORD extent, int target, const char* what)
+{
+    int hits = 0;
+    for (DWORD off = 0; off + 4 <= extent && hits < 32; off += 4)
+    {
+        int   i = *(const int*)(obj + off);
+        float f = *(const float*)(obj + off);
+
+        if (i == target)
+        {
+            Logf("construct      %s +0x%04X = %d (int)", what, off, i);
+            hits++;
+        }
+        else if (f == (float)target)
+        {
+            Logf("construct      %s +0x%04X = %.1f (float)", what, off, f);
+            hits++;
+        }
+    }
+    return hits;
+}
+
+// Every slot that moved since the last report. The confirmation step: click
+// the + or the - in the office window and exactly one of the offsets FindValue
+// listed should appear here, going 3500 -> 3400 or whatever the step is.
+static void DiffOffice(Office* o, DWORD extent)
+{
+    DWORD to = extent < OFFICE_SNAP ? extent : OFFICE_SNAP;
+
+    if (!o->haveSnap)
+    {
+        memcpy(o->snap, o->building, to);
+        o->haveSnap = 1;
+        return;
+    }
+
+    int printed = 0;
+    for (DWORD off = (DWORD)g_probeFrom; off + 4 <= to && printed < 24; off += 4)
+    {
+        int iNow = *(const int*)(o->building + off);
+        int iWas = *(const int*)(o->snap + off);
+        if (iNow == iWas) continue;
+
+        float fNow = *(const float*)(o->building + off);
+        float fWas = *(const float*)(o->snap + off);
+
+        // A pointer that moved decodes as a wild float and a huge int, and
+        // there are a lot of those. Anything that could be a distance in
+        // metres is what we are here for.
+        bool plausible = (iNow > 0 && iNow < 100000) ||
+                         (fNow == fNow && fNow > 0.0f && fNow < 100000.0f);
+        if (!plausible) continue;
+
+        Logf("construct      moved +0x%04X  int %d -> %d   float %.2f -> %.2f",
+             off, iWas, iNow, fWas, fNow);
+        printed++;
+    }
+    if (!printed)
+        Logf("construct      nothing that looks like a distance moved");
+
+    memcpy(o->snap, o->building, to);
+}
+
 // ---------------------------------------------------------------- the probe
 
 static void TypeHistogram(BYTE** begin, int count)
@@ -670,6 +766,29 @@ static void ReportOffice(Office* o, BYTE** bvBegin, int bvCount, int* claimedBy)
          b, o->type,
          havePos ? "placed" : "position unknown",
          extent);
+
+    // The range first, because the office's own window tells us what it is.
+    // Once per office: the value does not move unless the player moves it, and
+    // the diff below is what catches that.
+    if (g_probeExpect > 0 && !o->hunted)
+    {
+        Logf("construct    hunting %d in this office", g_probeExpect);
+        int hits = FindValue(b, extent, g_probeExpect, "office");
+
+        BYTE* td = *(BYTE**)(b + B_TYPEDESC);
+        if (td && ReadablePtr(td, 0x900))
+            hits += FindValue(td, 0x900, g_probeExpect, "type  ");
+
+        if (!hits)
+            Logf("construct    %d is nowhere in this office - is that the number the "
+                 "window shows? Set probe_expect to what it says.", g_probeExpect);
+        else
+            Logf("construct    %d candidate(s). Now click - or + on the office's "
+                 "auto-search range and watch which one moves.", hits);
+        o->hunted = 1;
+    }
+
+    if (g_probeDiff) DiffOffice(o, extent);
 
     // --- the candidate scan, until it settles -----------------------------
     if (!o->listOff)
@@ -935,17 +1054,22 @@ static void Tick(void)
     int    bvCount = Buildings(game, &bvBegin);
     if (bvCount <= 0) return;                   // no world loaded yet
 
-    if (!g_typedOnce)
-    {
-        TypeHistogram(bvBegin, bvCount);
-        g_typedOnce = true;
-    }
-
     DWORD now = GetTickCount();
     if (g_armed && now - g_lastReport < (DWORD)g_probePeriod * 1000) return;
     g_lastReport = now;
 
     g_offices = CollectOffices(bvBegin, bvCount);
+
+    // After collecting, not before. The first version printed the histogram on
+    // the first tick of the session - which on a fresh map is before any
+    // office exists - so it warned that type 12 was absent and, being a
+    // once-only line, never corrected itself when one was built.
+    if (!g_typedOnce && g_offices)
+    {
+        TypeHistogram(bvBegin, bvCount);
+        g_typedOnce = true;
+    }
+
     if (!g_offices)
     {
         if (!g_armed)
@@ -1123,6 +1247,8 @@ static void ReadSettings(void)
     g_probeTo     = H->configInt(ini, "construction", "probe_to",     g_probeTo);
     g_probePeriod = H->configInt(ini, "construction", "probe_period", g_probePeriod);
     g_probeSites  = H->configInt(ini, "construction", "probe_sites",  g_probeSites);
+    g_probeExpect = H->configInt(ini, "construction", "probe_expect", g_probeExpect);
+    g_probeDiff   = H->configInt(ini, "construction", "probe_diff",   g_probeDiff);
     g_rdataFrom   = H->configInt(ini, "construction", "rdata_from",   g_rdataFrom);
     g_rdataTo     = H->configInt(ini, "construction", "rdata_to",     g_rdataTo);
 
