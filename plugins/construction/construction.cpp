@@ -241,6 +241,7 @@ static int g_rdataTo   = 0x90C000;
 // ---------------------------------------------------------------- state
 
 #define MAX_OFFICES   16
+#define MAX_LIVE      2048      // live construction sites tracked in one report
 #define MAX_ELEMS     256       // most members a candidate list may hold
 #define MAX_TYPE      128       // histogram buckets
 #define EXTENT_CHUNK  0x400
@@ -783,13 +784,35 @@ static void Report(BYTE* game, BYTE** bvBegin, int bvCount)
     int day  = ReadablePtr(game + G_DAY, 8) ? *(const int*)(game + G_DAY)  : -1;
     int year = ReadablePtr(game + G_DAY, 8) ? *(const int*)(game + G_YEAR) : -1;
 
-    // Every live construction site on the map, so "unclaimed" means something.
-    int live = 0;
-    static int claimedBy[8192];
-    int  track = bvCount < 8192 ? bvCount : 8192;
+    static int   claimedBy[8192];
+    static int   liveIdx[MAX_LIVE];
+    static float liveCentre[MAX_LIVE][3];
+    static int   liveHasPos[MAX_LIVE];
+
+    int track = bvCount < 8192 ? bvCount : 8192;
     memset(claimedBy, 0, sizeof(int) * (size_t)track);
-    for (int i = 0; i < track; i++)
-        if (bvBegin[i] && IsUnfinished(bvBegin[i])) live++;
+
+    // Every live construction site on the map, gathered in ONE pass, with its
+    // position taken once while we are here.
+    //
+    // IsUnfinished is two VirtualQuery calls and BuildingCentre is an engine
+    // call. An earlier version of this ran both over the whole building vector
+    // for the header, again for the unclaimed count, and again per office -
+    // twenty thousand syscalls in a single frame on a decent city, every
+    // report, on the render thread. docs/07-pitfalls.md already records that
+    // shape once, as "A failed lookup once a frame is a frame-rate leak"; this
+    // is the same mistake one step out, and it is cheaper to not make it than
+    // to have it reported as the plugin making the game stutter.
+    int live = 0;
+    for (int i = 0; i < track && live < MAX_LIVE; i++)
+    {
+        BYTE* b = bvBegin[i];
+        if (!b || !IsUnfinished(b)) continue;
+
+        liveIdx[live]    = i;
+        liveHasPos[live] = BuildingCentre(b, liveCentre[live]) ? 1 : 0;
+        live++;
+    }
 
     Logf("construct  ---- day %d of year %d: %d office(s), %d live site(s) ----",
          day, year, g_offices, live);
@@ -801,8 +824,8 @@ static void Report(BYTE* game, BYTE** bvBegin, int bvCount)
     // below means anything: an office that stopped taking work on because
     // there was none left has demonstrated no limit of any kind.
     int unclaimed = 0;
-    for (int i = 0; i < track; i++)
-        if (bvBegin[i] && IsUnfinished(bvBegin[i]) && !claimedBy[i]) unclaimed++;
+    for (int k = 0; k < live; k++)
+        if (!claimedBy[liveIdx[k]]) unclaimed++;
 
     Logf("construct  %d live site(s), %d of them unclaimed", live, unclaimed);
 
@@ -818,13 +841,10 @@ static void Report(BYTE* game, BYTE** bvBegin, int bvCount)
         o->unclaimedMin = -1.0f;
         if (BuildingCentre(o->building, oc))
         {
-            for (int j = 0; j < track; j++)
+            for (int k = 0; k < live; k++)
             {
-                BYTE* s = bvBegin[j];
-                if (!s || !IsUnfinished(s) || claimedBy[j]) continue;
-                float sc[3];
-                if (!BuildingCentre(s, sc)) continue;
-                float d = Distance(oc, sc);
+                if (claimedBy[liveIdx[k]] || !liveHasPos[k]) continue;
+                float d = Distance(oc, liveCentre[k]);
                 if (o->unclaimedMin < 0.0f || d < o->unclaimedMin) o->unclaimedMin = d;
             }
         }
