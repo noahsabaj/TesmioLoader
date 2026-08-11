@@ -1,13 +1,23 @@
-# Construction offices — automatic assignment without the cap
+# Construction offices — how far one reaches for work
 
 **A plugin**, not part of the loader: `plugins/construction/construction.cpp` builds
 to `build/plugins/construction.dll`, and deleting that DLL restores the base game
 exactly. See [09-plugins.md](09-plugins.md) for the mechanism.
 
-**This is the measuring half.** The site table is empty, `patch` is 0 by default, and
-in this state the plugin reads construction offices and changes nothing at all about
-the game. Everything under [Where the cap lives](#where-the-cap-lives) is what the
-probe is for, not what it has found.
+A construction office only picks up jobs near itself, so a site across town is never
+started however idle the office is and however many vehicles it has parked. The point
+of this plugin is `office_range` — make that reach yours.
+
+**The range has not been found yet, so this release cannot change it.** What is here is
+the half that finds it: `patch` is 0, both site tables are empty, and in this state the
+plugin reads construction offices and changes nothing at all. Everything under
+[Where the range lives](#where-the-range-lives) is what the probe is for, not what it
+has found.
+
+A **count cap** — an office that stops at N jobs however close they are — is the other
+thing the limit could turn out to be. Both produce the same symptom, an idle office
+beside unstarted work, so the probe measures both and keeps them in separate tables:
+finding one must not block patching the other.
 
 ## What this is not
 
@@ -16,9 +26,16 @@ already have a plugin: [12-walking.md](12-walking.md), `distance` and `car_dista
 in `plugins/walking.ini`, published on the Steam Workshop as *Increase Walking
 Distance*. Nothing here touches `query+0x3C` for feet or for cars.
 
-That is the first thing a reader assumes this does, so it is said first. The two
-features look alike from outside — both are "a limit on how far something reaches" —
-and they share no code, no address and no mechanism.
+That is the first thing a reader assumes this does, so it is said first — and the
+confusion is easy, because all three are "how far something reaches". The difference
+is **who is travelling**. `walking`'s two numbers are about a *citizen* getting to
+work, a shop or a service on foot or in their own car. This is about a construction
+*office* dispatching its own fleet to a job. Different traveller, different list,
+different constant.
+
+`car_distance = 10000` will not extend an office's reach, and if it appears to, the
+probe will say so outright: it checks whether every job an office took is one already
+in that office's personal-car connection list.
 
 ## What automatic assignment is, in the engine
 
@@ -80,14 +97,19 @@ The probe tells them apart for free, by reporting **where** the number lives: on
 office object or its type descriptor for the first, at a fixed offset in the game
 object for the second.
 
-## Where the cap lives
+## Where the range lives
 
-| Role | Function | Site | Value |
+| Group | Role | Site | Value |
 |---|---|---|---|
-| — | — | — | *not found yet* |
+| `range` | office pickup range | — | *not found yet* |
+| `cap` | office assignment count | — | *not found yet* |
 
 Filled in by the probe. Until then `patch = 1` logs `no address for ... yet` and
 writes nothing.
+
+Two groups rather than one because they are independent findings. A group is verified
+whole before a single byte of it is written — if the simulation's copy of the range
+verifies and the office panel's does not, neither is touched.
 
 ## How the probe finds the list
 
@@ -109,21 +131,55 @@ is a write into a stranger's struct*. A candidate is accepted only on all of:
 disagreeing with what the panel lists is wrong, and everything downstream of it is
 worthless. The log says so in as many words when it accepts one.
 
-## Cap or radius
+## Bracketing the range
 
-Three numbers per report, and they only mean anything together:
+This is the measurement the plugin exists for. Per office, per report:
 
 | | |
 |---|---|
-| `held` | how many sites this office has taken on |
-| `live` | unfinished buildings on the whole map |
+| `claimedMax` | the farthest job this office took on |
+| `unclaimedMin` | the nearest job it **refused** |
 | `unclaimed` | live sites in no office's list at all |
 
-- `held` frozen over three reports **while `unclaimed` climbs** → `held` is the cap.
-  Without the second half this is just an office that has taken on everything there is.
-- an unclaimed site **nearer** than one already claimed → the gate is a count, not a
-  radius.
-- a clean gap between farthest-claimed and nearest-unclaimed → a radius lies in it.
+`unclaimed` has to be non-zero for any of it to mean anything — an office that stopped
+taking work because there was none left has demonstrated no limit of any kind, and the
+log says exactly that instead of a verdict.
+
+Then:
+
+- **`unclaimedMin > claimedMax`** → the range is bracketed between them. This is the
+  answer, and the probe immediately hunts for a number in that bracket.
+- **`unclaimedMin < claimedMax`** → a job *nearer* than one already taken was refused,
+  so distance is not the gate. It is a count, and `office_limit` is the setting that
+  matters rather than `office_range`.
+
+`unclaimedMin` is computed **per office**, not globally: two offices in different towns
+have completely different neighbourhoods, and averaging them erases the boundary.
+
+### Hunting the number
+
+Given a bracket, the range is searched for as a float and as an int in four places, and
+every hit is logged with its offset:
+
+| Where | Why |
+|---|---|
+| the office object | a per-office field |
+| its type descriptor | a per-type figure, like `$WORKING_VEHICLES_NEEDED` |
+| the game object | a global setting, the way `game+0x5DC` is |
+| **`.rdata`, `0x909000`–`0x90C000`** | **the likeliest by far** |
+
+The last one is the pool this game keeps its layout constants and rates in — where
+`walking`'s 480 and 530, `cities`' 1000 and every deposit search radius live. No
+`building.ini` declares a range and every office behaves the same, so it is a global,
+and a global float in this executable lives there.
+
+The bracket is widened before searching — down 10% and up to double — because the game
+measures a **path along roads** while the probe measures a **straight line**. The real
+constant is at or above the straight-line bracket, never inside it.
+
+Hits are candidates, nothing more. 2500 appears in `.rdata` for several unrelated
+reasons, which is exactly why the patch repoints one instruction rather than
+overwriting the constant.
 
 Two further things the probe reports because each can end the investigation early:
 
@@ -166,12 +222,18 @@ verdict is *"not on the `Person`"*, never *"not in the game"*.
 | Key | Default | What |
 |---|---|---|
 | `enabled` | 1 | 0 unloads the plugin without reading anything |
-| `probe` | 1 | follow the offices and report what moves |
-| `patch` | 0 | write the patches. Needs an address in the site table |
-| `office_limit` | 0 | sites one office will take on. 0 is no cap |
+| `probe` | 1 | bracket the range and hunt for it |
+| `patch` | 0 | write the patches. Needs an address in a site table |
+| **`office_range`** | **10000** | **metres of reach. The point of the plugin** |
+| `office_limit` | 0 | jobs one office will take on, if the gate is a count. 0 is no cap |
 | `probe_from`, `probe_to` | 768, 6144 | which part of an office to compare |
 | `probe_period` | 5 | seconds between reports |
 | `probe_sites` | 8 | list members printed per office |
+| `rdata_from`, `rdata_to` | `0x909000`, `0x90C000` | the constant pool searched for the range. Decimal in the file — the profile API does not take `0x` |
+
+`office_range` is a **path length along roads**, not a straight line, and is clamped at
+20000 for the reason `walking` clamps at the same figure: these searches are
+breadth-first over the road graph, so the work grows with the square of the limit.
 
 ## What a save keeps
 
@@ -207,12 +269,26 @@ construct    +0x0CE8 held once - waiting for a second sample
 construct    ACCEPTED +0x0CE8 after two consecutive samples - open this office's
              window and check it lists 8 site(s)
 construct      site  0  000002...  type   2   118.4 m  car list yes  progress 0.12
-construct    holds 8 site(s)  farthest 412.7 m  growable  every one is in the car list
-construct  41 live site(s), 33 unclaimed, nearest unclaimed 265.1 m from office 0
-construct  office 000002...: held 8 over 3 report(s) with 33 site(s) unclaimed - 8 is
-           the cap. Search for it as an int and a float.
-construct  office 000002...: an unclaimed site at 265.1 m sits inside a claimed one at
-           412.7 m - the gate is a count, not a radius
+construct    holds 8 site(s)  from 44.2 m to 412.7 m  growable  not all in the car list
+construct  41 live site(s), 33 of them unclaimed
+construct  office 000002...: claimed out to 412.7 m, nearest refused 604.9 m
+construct  office 000002...: RANGE IS BETWEEN 412.7 m AND 604.9 m - hunting for it
+construct      .rdata  +0x90AD50 = 500.000
+construct      .rdata  +0x90B0C4 = 600.000
+construct  office 000002...: 2 candidate(s) in 371..1210. The .rdata ones are the ones
+           to try first - repoint the read, never overwrite the constant.
+```
+
+The two lines that matter are the bracket and the `.rdata` hits under it. Those RVAs are
+what phase two goes and verifies.
+
+The other outcome, which is just as useful:
+
+```
+construct  office 000002...: a refused site at 265.1 m sits INSIDE a taken one at
+           412.7 m - distance is not the gate here, a count is
+construct  office 000002...: held 8 over 3 report(s) with 33 site(s) unclaimed - 8 may
+           also be a count cap
 ```
 
 A refusal, in the project's usual voice — the address, what was found, what was
@@ -226,21 +302,26 @@ construct  office: 2 site(s) did not verify - nothing written
 
 ## Testing it
 
-The answer comes from the game, not the log alone. In order:
+The answer comes from the game, not the log alone. The range is the goal, so the road
+comes first:
 
-1. **One 8-vehicle `construction_office`**, its vehicles bought, on a road. Place
-   construction sites one at a time within 200 m, pausing for a report. Watch `held`
-   climb, then freeze while `unclaimed` climbs. **The cap is where it freezes.**
-2. **Cancel one assigned site.** `held` must drop and an unclaimed site must be picked
-   up next report. If it does not, the gate is on something other than the list.
-3. **Build the road out to 5 km first**, then place sites at roughly 600, 1200, 2500
-   and 5000 m. Road first is not optional: "refused for no road" and "refused for
-   distance" look identical in the log otherwise.
-4. **Repeat on the 6-, 12- and 24-vehicle offices.** The six stock offices declare six
-   different `$WORKING_VEHICLES_NEEDED` (6, 8, 12, 14, 16, 24; rail 4). If the cap
-   tracks that number it is per-type data and may need no code patch at all. If it is
-   identical on all of them, it is a literal in `.text`.
-5. **Open each office's window** and count its entries against `holds N`. A mismatch
+1. **Build the road out to about 5 km before placing anything.** This is not optional
+   and it is the step people skip: a site with no road is refused for a completely
+   different reason, and "refused for no road" and "refused for distance" are
+   indistinguishable in the log.
+2. **One `construction_office` on that road**, its vehicles bought.
+3. **Place sites along the road at roughly 200, 600, 1200, 2500 and 5000 m**, one at a
+   time, letting a report land between each. Watch `claimed out to` climb and
+   `nearest refused` appear. When the refused one is further than everything claimed,
+   the bracket is the range and the `.rdata` hunt fires by itself.
+4. **Then test the count**, separately: place several sites all within 200 m and watch
+   whether the office stops taking them even though they are close. If it does, there
+   is a cap as well as a range.
+5. **Repeat on the 6-, 12- and 24-vehicle offices.** The six stock offices declare six
+   different `$WORKING_VEHICLES_NEEDED` (6, 8, 12, 14, 16, 24; rail 4). If either
+   number tracks that, it is per-type data and may need no code patch at all; if it is
+   identical on all of them, it is a literal.
+6. **Open each office's window** and count its entries against `holds N`. A mismatch
    invalidates everything above.
 
 ## State

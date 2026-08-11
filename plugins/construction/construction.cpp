@@ -1,12 +1,20 @@
-// construction - the limits on a construction office, as a tesmioloader plugin.
+// construction - how far a construction office reaches for work, as a
+// tesmioloader plugin.
 //
-// STATE: this is the measuring half, and it is all that is here yet. It finds
-// which field of a construction office holds the set of sites the office has
-// taken on, and what stops that set growing; the patch lands once those two
-// things are known. Nothing in this plugin changes the game. The site table
-// below is deliberately empty and `patch` is 0 by default - a table of zeroes
-// logs "no address yet" rather than refusing, which is the right way round for
-// a plugin whose whole first release is a question.
+// THE FEATURE: a construction office only picks up jobs near itself. This is
+// meant to make that reach configurable - `office_range` in the ini, 10 km by
+// default - so an office serves a whole district instead of a few streets.
+//
+// STATE: THE RANGE HAS NOT BEEN FOUND YET, so this release cannot change it.
+// What is here is the half that finds it: the probe brackets the range by
+// watching which sites an office takes and which it refuses, then hunts the
+// executable for a number in that bracket. `patch` is 0 and both site tables
+// are empty; a table of zeroes logs "no address yet" rather than refusing,
+// which is the right way round for a plugin whose first release is a question.
+//
+// A count cap is the other thing the limit could be - an office that stops at
+// N jobs however close they are - so the probe measures both and keeps them in
+// separate tables, because finding one must not block patching the other.
 //
 //
 // WHAT AUTOMATIC ASSIGNMENT IS
@@ -159,8 +167,9 @@ enum SiteKind
     SITE_CMP_IMM8     // cmp dword[reg+disp32],imm8   - rewrite rip-relative
 };
 
-#define SLOT_OFFICE_LIMIT  0
-#define SLOT_COUNT         1
+#define SLOT_OFFICE_RANGE  0
+#define SLOT_OFFICE_LIMIT  1
+#define SLOT_COUNT         2
 
 struct Site
 {
@@ -182,20 +191,31 @@ struct Group
     const char* label;
 };
 
-// v1.1.1.9. One row per site the cap turns out to need. Budget for more than
-// one: a count cap, possibly a radius, and very likely the office panel's own
-// copy of whichever it is. plugins/walking took four versions to learn that
-// patching the simulation and leaving the window drawing the old number is a
-// bug and not a partial success.
-static const Site kOfficeSites[] = {
+// v1.1.1.9, and both tables are empty until the probe fills them in.
+//
+// THE RANGE is the one this plugin exists for: how far from itself an office
+// will pick up a job. Budget for more than one row - if this behaves like every
+// other distance in this game there is the simulation's copy and the office
+// panel's own copy of it, and patching one while the other draws the old number
+// is the bug plugins/walking took four versions to stop shipping.
+static const Site kRangeSites[] = {
+    { 0, SITE_RIP_FLOAT, NULL, 0, 0, 0.0, SLOT_OFFICE_RANGE, "office pickup range" },
+};
+
+// THE COUNT is the other thing the limit could turn out to be, kept separate so
+// that finding one does not block patching the other.
+static const Site kLimitSites[] = {
     { 0, SITE_RIP_INT32, NULL, 0, 0, 0.0, SLOT_OFFICE_LIMIT, "office assign cap" },
 };
 
-static int g_officeOk[sizeof(kOfficeSites) / sizeof(kOfficeSites[0])];
+static int g_rangeOk[sizeof(kRangeSites) / sizeof(kRangeSites[0])];
+static int g_limitOk[sizeof(kLimitSites) / sizeof(kLimitSites[0])];
 
-static const Group kOfficeGroup = {
-    kOfficeSites, sizeof(kOfficeSites) / sizeof(kOfficeSites[0]),
-    g_officeOk, "office"
+static const Group kRangeGroup = {
+    kRangeSites, sizeof(kRangeSites) / sizeof(kRangeSites[0]), g_rangeOk, "range"
+};
+static const Group kLimitGroup = {
+    kLimitSites, sizeof(kLimitSites) / sizeof(kLimitSites[0]), g_limitOk, "cap"
 };
 
 // ---------------------------------------------------------------- settings
@@ -204,12 +224,19 @@ static int g_enabled  = 1;
 static int g_patch    = 0;      // the second half; off until the table is filled
 static int g_probe    = 1;      // and the first half, which is what 0.1 is for
 
-static int g_officeLimit = 0;   // 0 = no cap at all
+static int g_officeRange = 10000;  // metres of reach. The point of the plugin
+static int g_officeLimit = 0;      // 0 = no cap at all
 
 static int g_probeFrom   = 0x300;
 static int g_probeTo     = 0x1800;
 static int g_probePeriod = 5;   // seconds between reports
 static int g_probeSites  = 8;   // how many list members to print per office
+
+// The .rdata window searched for the range once it has been bracketed. The
+// default spans the pool the game keeps its layout constants and rates in -
+// where walking's 480 and 530, cities' 1000 and the deposit radii all live.
+static int g_rdataFrom = 0x909000;
+static int g_rdataTo   = 0x90C000;
 
 // ---------------------------------------------------------------- state
 
@@ -242,7 +269,15 @@ struct Office
     int   frozen;       // consecutive reports held did not move while work waited
     int   maxHeld;
     int   growable;     // cap > end, i.e. a real vector rather than a fixed array
-    float claimedMax;   // farthest site it has taken on, -1 when unknown
+
+    // The range evidence. Everything inside claimedMax was picked up; the
+    // nearest thing it refused is unclaimedMin. When those two do not overlap
+    // the range is bracketed between them, and that bracket is the whole point
+    // of this plugin.
+    float claimedMin;
+    float claimedMax;
+    float unclaimedMin;
+    int   scanned;      // the .rdata hunt is done once per bracket, not per report
 };
 
 static Office g_office[MAX_OFFICES];
@@ -388,6 +423,49 @@ static float Distance(const float* a, const float* b)
 {
     float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
     return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+// ---------------------------------------------------------------- finding a number
+//
+// Once the probe has bracketed the range - everything inside R is picked up,
+// everything outside it is not - the number R has to be somewhere. This looks
+// for it, as a float, in the three places it could live, and reports every hit
+// with its offset.
+//
+// A range is far more likely to be a literal in .rdata than a field of an
+// office, because building.ini declares no such thing and every office behaves
+// the same. .rdata is therefore scanned too, over the window the game keeps
+// its layout constants and rates in - the same pool walking's 480 and 530 and
+// cities' 1000 come out of.
+//
+// Hits are candidates and nothing more. The value 2500 appears in .rdata for
+// several unrelated reasons, which is exactly why walking repoints one
+// instruction rather than overwriting the constant.
+static int ScanFloatRange(BYTE* base, DWORD from, DWORD to,
+                          float lo, float hi, const char* what, int maxHits)
+{
+    int hits = 0;
+    for (DWORD off = from; off + 4 <= to && hits < maxHits; off += 4)
+    {
+        if (!ReadablePtr(base + off, 4)) continue;
+        float v = *(const float*)(base + off);
+        if (v != v) continue;                       // NaN
+        if (v < lo || v > hi) continue;
+
+        Logf("construct      %s +0x%06X = %.3f", what, off, v);
+        hits++;
+    }
+    // The same bytes as an int, for a range stored in whole metres.
+    for (DWORD off = from; off + 4 <= to && hits < maxHits; off += 4)
+    {
+        if (!ReadablePtr(base + off, 4)) continue;
+        int v = *(const int*)(base + off);
+        if ((float)v < lo || (float)v > hi) continue;
+
+        Logf("construct      %s +0x%06X = %d (int)", what, off, v);
+        hits++;
+    }
+    return hits;
 }
 
 // Is this building in the office's personal-car connection list? If every
@@ -664,6 +742,7 @@ static void ReportOffice(Office* o, BYTE** bvBegin, int bvCount, int* claimedBy)
     // Claimed members, with distances, and whether the car list explains them.
     BYTE* begin = *(BYTE**)(b + o->listOff);
     float claimedMax = -1.0f;
+    float claimedMin = -1.0f;
     int   parkingAll = 1;
 
     for (int i = 0; i < held; i++)
@@ -675,7 +754,11 @@ static void ReportOffice(Office* o, BYTE** bvBegin, int bvCount, int* claimedBy)
         float mc[3];
         float d = -1.0f;
         if (havePos && BuildingCentre(m, mc)) d = Distance(centre, mc);
-        if (d > claimedMax) claimedMax = d;
+        if (d >= 0.0f)
+        {
+            if (d > claimedMax) claimedMax = d;
+            if (claimedMin < 0.0f || d < claimedMin) claimedMin = d;
+        }
 
         bool park = InParkingList(b, m);
         if (!park) parkingAll = 0;
@@ -687,9 +770,10 @@ static void ReportOffice(Office* o, BYTE** bvBegin, int bvCount, int* claimedBy)
     }
 
     o->claimedMax = claimedMax;
+    o->claimedMin = claimedMin;
 
-    Logf("construct    holds %d site(s)  farthest %.1f m  %s  %s",
-         held, claimedMax,
+    Logf("construct    holds %d site(s)  from %.1f m to %.1f m  %s  %s",
+         held, claimedMin, claimedMax,
          o->growable ? "growable" : "FIXED ARRAY",
          parkingAll && held ? "every one is in the car list" : "not all in the car list");
 }
@@ -713,65 +797,110 @@ static void Report(BYTE* game, BYTE** bvBegin, int bvCount)
     for (int i = 0; i < g_offices; i++)
         ReportOffice(&g_office[i], bvBegin, track, claimedBy);
 
-    // Unclaimed = a live site in nobody's list. This is the number that turns
-    // "held stopped moving" into "held is a cap" rather than "the player ran
-    // out of things to build".
+    // Unclaimed = a live site in nobody's list. Without this number nothing
+    // below means anything: an office that stopped taking work on because
+    // there was none left has demonstrated no limit of any kind.
     int unclaimed = 0;
-    float nearestUnclaimed = -1.0f;
     for (int i = 0; i < track; i++)
-    {
-        BYTE* b = bvBegin[i];
-        if (!b || !IsUnfinished(b) || claimedBy[i]) continue;
-        unclaimed++;
-        if (g_offices)
-        {
-            float oc[3], mc[3];
-            if (BuildingCentre(g_office[0].building, oc) && BuildingCentre(b, mc))
-            {
-                float d = Distance(oc, mc);
-                if (nearestUnclaimed < 0.0f || d < nearestUnclaimed) nearestUnclaimed = d;
-            }
-        }
-    }
+        if (bvBegin[i] && IsUnfinished(bvBegin[i]) && !claimedBy[i]) unclaimed++;
 
-    Logf("construct  %d live site(s), %d unclaimed, nearest unclaimed %.1f m from office 0",
-         live, unclaimed, nearestUnclaimed);
+    Logf("construct  %d live site(s), %d of them unclaimed", live, unclaimed);
 
-    // The verdicts. Both need `unclaimed` to be non-zero - an office that has
-    // taken on everything there is has not demonstrated a limit of any kind.
     for (int i = 0; i < g_offices; i++)
     {
         Office* o = &g_office[i];
         if (!o->listOff) continue;
 
-        if (unclaimed > 0 && o->held == o->heldPrev)
+        // The nearest thing THIS office refused. Per office, because two
+        // offices in different towns have completely different neighbourhoods
+        // and averaging them would erase the boundary we are looking for.
+        float oc[3];
+        o->unclaimedMin = -1.0f;
+        if (BuildingCentre(o->building, oc))
+        {
+            for (int j = 0; j < track; j++)
+            {
+                BYTE* s = bvBegin[j];
+                if (!s || !IsUnfinished(s) || claimedBy[j]) continue;
+                float sc[3];
+                if (!BuildingCentre(s, sc)) continue;
+                float d = Distance(oc, sc);
+                if (o->unclaimedMin < 0.0f || d < o->unclaimedMin) o->unclaimedMin = d;
+            }
+        }
+
+        if (!unclaimed)
+        {
+            Logf("construct  office %p: holds everything there is - place more sites, "
+                 "further out, before this can show a range", o->building);
+            continue;
+        }
+
+        Logf("construct  office %p: claimed out to %.1f m, nearest refused %.1f m",
+             o->building, o->claimedMax, o->unclaimedMin);
+
+        // --- THE RANGE, which is the whole question -----------------------
+        //
+        // A refused site NEARER than one already taken on means distance is
+        // not what is being filtered on. A clean gap the other way brackets
+        // the range between the two numbers, and that bracket is what the
+        // .rdata hunt below is given.
+        if (o->held > 0 && o->unclaimedMin >= 0.0f && o->claimedMax >= 0.0f)
+        {
+            if (o->unclaimedMin < o->claimedMax)
+            {
+                Logf("construct  office %p: a refused site at %.1f m sits INSIDE a taken "
+                     "one at %.1f m - distance is not the gate here, a count is",
+                     o->building, o->unclaimedMin, o->claimedMax);
+            }
+            else if (!o->scanned)
+            {
+                float lo = o->claimedMax;
+                float hi = o->unclaimedMin;
+                Logf("construct  office %p: RANGE IS BETWEEN %.1f m AND %.1f m - hunting "
+                     "for it", o->building, lo, hi);
+
+                // Widened a little at both ends: the game measures a path along
+                // roads and this measures a straight line, so the constant is
+                // at or above the straight-line bracket rather than inside it.
+                float wlo = lo * 0.9f;
+                float whi = hi * 2.0f;
+
+                int hits = 0;
+                DWORD extent = ReadableExtent(o->building, (DWORD)g_probeTo);
+                hits += ScanFloatRange(o->building, 0, extent, wlo, whi, "office ", 12);
+
+                BYTE* td = *(BYTE**)(o->building + B_TYPEDESC);
+                if (td) hits += ScanFloatRange(td, 0, 0x900, wlo, whi, "type   ", 12);
+
+                hits += ScanFloatRange(game, 0, 0x14000, wlo, whi, "game   ", 12);
+
+                // The likeliest home by far. building.ini declares no range and
+                // every office behaves alike, so it is a global - and a global
+                // float in this executable lives in the shared literal pool.
+                hits += ScanFloatRange(g_exeBase, (DWORD)g_rdataFrom, (DWORD)g_rdataTo,
+                                       wlo, whi, ".rdata ", 24);
+
+                Logf("construct  office %p: %d candidate(s) in %.0f..%.0f. The .rdata "
+                     "ones are the ones to try first - repoint the read, never "
+                     "overwrite the constant.", o->building, hits, wlo, whi);
+                o->scanned = 1;
+            }
+        }
+
+        // --- and the count, which is the other thing it could be ----------
+        if (o->held == o->heldPrev)
         {
             o->frozen++;
-            if (o->frozen >= 3)
-                Logf("construct  office %p: held %d over %d report(s) with %d site(s) "
-                     "unclaimed - %d is the cap. Search for it as an int and a float.",
-                     o->building, o->held, o->frozen, unclaimed, o->held);
+            if (o->frozen == 3)
+                Logf("construct  office %p: held %d over 3 report(s) with %d site(s) "
+                     "unclaimed - %d may also be a count cap",
+                     o->building, o->held, unclaimed, o->held);
         }
         else
         {
-            o->frozen = 0;
-        }
-
-        // Cap or radius, decided by which of the two sets reaches further. An
-        // unclaimed site NEARER than one the office already took on means
-        // distance is not what is being filtered on; a clean gap the other way
-        // means a radius lives somewhere between the two numbers.
-        if (unclaimed > 0 && o->held > 0 &&
-            nearestUnclaimed >= 0.0f && o->claimedMax >= 0.0f)
-        {
-            if (nearestUnclaimed < o->claimedMax)
-                Logf("construct  office %p: an unclaimed site at %.1f m sits inside a "
-                     "claimed one at %.1f m - the gate is a count, not a radius",
-                     o->building, nearestUnclaimed, o->claimedMax);
-            else
-                Logf("construct  office %p: everything claimed is within %.1f m and the "
-                     "nearest unclaimed is %.1f m - a radius lies between them",
-                     o->building, o->claimedMax, nearestUnclaimed);
+            o->frozen  = 0;
+            o->scanned = 0;      // the bracket moved; hunt again when it settles
         }
     }
 
@@ -967,12 +1096,15 @@ static void ReadSettings(void)
     g_enabled     = H->configInt(ini, "construction", "enabled",      g_enabled);
     g_patch       = H->configInt(ini, "construction", "patch",        g_patch);
     g_probe       = H->configInt(ini, "construction", "probe",        g_probe);
+    g_officeRange = H->configInt(ini, "construction", "office_range", g_officeRange);
     g_officeLimit = H->configInt(ini, "construction", "office_limit", g_officeLimit);
 
     g_probeFrom   = H->configInt(ini, "construction", "probe_from",   g_probeFrom);
     g_probeTo     = H->configInt(ini, "construction", "probe_to",     g_probeTo);
     g_probePeriod = H->configInt(ini, "construction", "probe_period", g_probePeriod);
     g_probeSites  = H->configInt(ini, "construction", "probe_sites",  g_probeSites);
+    g_rdataFrom   = H->configInt(ini, "construction", "rdata_from",   g_rdataFrom);
+    g_rdataTo     = H->configInt(ini, "construction", "rdata_to",     g_rdataTo);
 
     if (g_probeFrom < 0)          g_probeFrom = 0;
     if (g_probeTo <= g_probeFrom) g_probeTo = g_probeFrom + 0x800;
@@ -980,6 +1112,18 @@ static void ReadSettings(void)
     if (g_probePeriod < 1)        g_probePeriod = 1;
     if (g_probeSites < 0)         g_probeSites = 0;
     if (g_officeLimit < 0)        g_officeLimit = 0;
+    if (g_officeRange < 0)        g_officeRange = 0;
+    if (g_officeRange > 20000)
+    {
+        // The same ceiling plugins/walking uses, for the same reason: these
+        // searches are breadth-first over the road graph, so the work grows
+        // with the square of the limit.
+        Logf("construct  office_range %d is past the 20000 ceiling - clamped",
+             g_officeRange);
+        g_officeRange = 20000;
+    }
+    if (g_rdataFrom < 0)          g_rdataFrom = 0;
+    if (g_rdataTo <= g_rdataFrom) g_rdataTo = g_rdataFrom + 0x1000;
 }
 
 extern "C" __declspec(dllexport) unsigned TsmPluginApiVersion(void)
@@ -1041,7 +1185,10 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         if (!g_slot)
             Logf("construct  no allocation within reach of the executable - not patching");
         else
-            written += PatchGroup(&kOfficeGroup, (double)g_officeLimit);
+        {
+            written += PatchGroup(&kRangeGroup, (double)g_officeRange);
+            written += PatchGroup(&kLimitGroup, (double)g_officeLimit);
+        }
     }
 
     if (!armed && !written)
