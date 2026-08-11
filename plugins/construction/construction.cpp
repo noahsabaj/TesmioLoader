@@ -216,11 +216,55 @@ struct ClampSite
     const char* label;
 };
 
+// --- and the ladder, which is what the buttons actually walk ---------------
+//
+// The range is not a slider. The minus and plus buttons step through a fixed
+// menu of rungs, and each button has its own copy of it:
+//
+//   0076C792  B9 B8 0B 00 00        mov  ecx,3000
+//   0076C797  B8 AC 0D 00 00        mov  eax,3500        ; the top rung
+//   0076C79C  44 3B C0              cmp  r8d,eax
+//   0076C79F  7F 1E                 jg   -> take 3500    ; anything above snaps here
+//   ... then 3000, then 2000, then r9d, then 100
+//
+// which is why pressing minus on an office holding 10000 gave 3500 rather than
+// stepping down: 10000 is above the top rung, so the ladder snapped to it.
+// The step-up ladder at 0x76C7C5 is the same menu read the other way, and its
+// own copy of 3500 is the reason plus stops there.
+//
+// So the four sites above were real - the game does clamp the field in a
+// validator - but they are not what the buttons obey. These three are.
+//
+// Raising the top rung is all that is done here. Adding rungs would mean
+// emitting code; changing the top one is four bytes each and leaves the menu
+// otherwise exactly as the game shipped it.
+
+#define RVA_LADDER_DOWN   0x76C792   // mov ecx,3000 / mov eax,3500
+#define RVA_LADDER_UP_CMP 0x76C7C5   // mov ecx,[r12] / cmp ecx,3500
+#define RVA_LADDER_UP_SET 0x76C7D1   // mov eax,3500 / jmp / mov eax,3000
+
+static const BYTE kLadderDown[] = {
+    0xB9, 0xB8, 0x0B, 0x00, 0x00,                // mov ecx,3000
+    0xB8, 0xAC, 0x0D, 0x00, 0x00                 // mov eax,3500   <- imm at +6
+};
+static const BYTE kLadderUpCmp[] = {
+    0x41, 0x8B, 0x0C, 0x24,                      // mov ecx,[r12]
+    0x81, 0xF9, 0xAC, 0x0D, 0x00, 0x00           // cmp ecx,3500   <- imm at +6
+};
+static const BYTE kLadderUpSet[] = {
+    0xB8, 0xAC, 0x0D, 0x00, 0x00,                // mov eax,3500   <- imm at +1
+    0xEB, 0x22,                                  // jmp +0x22
+    0xB8, 0xB8, 0x0B, 0x00, 0x00                 // mov eax,3000
+};
+
 static const ClampSite kClampSites[] = {
-    { RVA_CLAMP_CMP_A, kClampCmpA, sizeof(kClampCmpA), 10, "handler compare" },
-    { RVA_CLAMP_SET_A, kClampSetA, sizeof(kClampSetA),  6, "handler store"   },
-    { RVA_CLAMP_CMP_B, kClampCmpB, sizeof(kClampCmpB),  9, "second compare"  },
-    { RVA_CLAMP_SET_B, kClampSetB, sizeof(kClampSetB),  1, "second store"    },
+    { RVA_CLAMP_CMP_A,   kClampCmpA,   sizeof(kClampCmpA),  10, "validator compare" },
+    { RVA_CLAMP_SET_A,   kClampSetA,   sizeof(kClampSetA),   6, "validator store"   },
+    { RVA_CLAMP_CMP_B,   kClampCmpB,   sizeof(kClampCmpB),   9, "second compare"    },
+    { RVA_CLAMP_SET_B,   kClampSetB,   sizeof(kClampSetB),   1, "second store"      },
+    { RVA_LADDER_DOWN,   kLadderDown,  sizeof(kLadderDown),  6, "minus top rung"    },
+    { RVA_LADDER_UP_CMP, kLadderUpCmp, sizeof(kLadderUpCmp), 6, "plus compare"      },
+    { RVA_LADDER_UP_SET, kLadderUpSet, sizeof(kLadderUpSet), 1, "plus top rung"     },
 };
 #define CLAMP_SITE_COUNT (sizeof(kClampSites) / sizeof(kClampSites[0]))
 
@@ -408,6 +452,7 @@ struct Office
     float unclaimedMin;
     int   scanned;      // the .rdata hunt is done once per bracket, not per report
 
+    int   raised;       // decided about once, and never reconsidered
     int   hunted;       // the value hunt is done once per office, not per report
     int   haveSnap;
     BYTE  snap[OFFICE_SNAP];
@@ -758,8 +803,20 @@ static void WriteRanges(void)
 
     for (int i = 0; i < g_offices; i++)
     {
-        BYTE* b = g_office[i].building;
+        Office* o = &g_office[i];
+        BYTE*   b = o->building;
         if (!b) continue;
+
+        // Decided once, and never reconsidered. This is the fix for a bug that
+        // was mine: the rule used to be "raise anything sitting at the game's
+        // default", and the minus button's own bottom rung IS that default. So
+        // stepping an office down to 1000 by hand looked identical to a
+        // freshly built one, and the plugin put it straight back to 10000 -
+        // which made the minus button cycle 3500, 3000, 2000, 10000 for ever.
+        //
+        // "Have we already made a decision about this office" is the honest
+        // question, and the value alone could never answer it.
+        if (o->raised) continue;
 
         // Still an office, and still readable. The building vector is walked
         // fresh every report, but this runs between reports too.
@@ -779,24 +836,22 @@ static void WriteRanges(void)
             continue;
         }
 
-        // A DEFAULT, NOT A CAGE. Only an office still carrying the game's own
-        // starting value is raised; one the player has set to anything else is
-        // theirs and is left alone. Without this the minus button in the office
-        // window is unusable - the click lands, and the next frame puts our
-        // value back, which reads as the number flickering and refusing to
-        // move.
-        //
-        // The test is the value rather than a list of offices we have already
-        // seen, because a value survives a save and reload and a pointer does
-        // not: an office the player set to 2000 comes back as 2000 and is still
-        // recognisably not the default.
-        if (g_gameDefault > 0 && now != g_gameDefault) continue;
+        // A DEFAULT, NOT A CAGE. An office already carrying something other
+        // than the game's starting value was set by the player - on this map
+        // or in an earlier session, since the value is saved - so it is theirs.
+        // Mark it decided and never look at it again.
+        if (g_gameDefault > 0 && now != g_gameDefault)
+        {
+            o->raised = 1;
+            continue;
+        }
 
         // Anything other than the value we last put here, when we have written
         // before, is the game putting it back.
         if (g_wroteOnce && g_gameDefault <= 0 && now != g_officeRange) clamped++;
 
         *(int*)(b + B_OFFICE_RANGE) = g_officeRange;
+        o->raised = 1;
         wrote++;
     }
 
