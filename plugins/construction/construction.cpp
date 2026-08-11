@@ -150,6 +150,80 @@
 // plugin exists to get past.
 #define VANILLA_RANGE_MAX    3500
 
+// --- the ceiling, and where it is written down ----------------------------
+//
+// 3500 is not read from anywhere. It is an imm32 baked into the office
+// window's own button handler, twice, as a plain clamp:
+//
+//   0074E084  8B 86 C8 0F 00 00     mov  eax,[rsi+0xFC8]
+//   0074E08A  41 3B C4              cmp  eax,r12d
+//   0074E08D  7D 09                 jge  +9
+//   0074E08F  44 89 A6 C8 0F 00 00  mov  [rsi+0xFC8],r12d      ; up to a minimum
+//   0074E096  EB 11                 jmp  +0x11
+//   0074E098  3D AC 0D 00 00        cmp  eax,3500              ; <- and down to
+//   0074E09D  7E 0A                 jle  +0xA
+//   0074E09F  C7 86 C8 0F 00 00 AC 0D 00 00
+//                                   mov  [rsi+0xFC8],3500      ; <- 3500
+//
+// which is the whole reason the plus button stops there, and the reason
+// pressing minus on an office this plugin had set to 10000 snapped it to 3500
+// rather than stepping down: the click ran this, and the clamp fired.
+//
+// It also confirms +0xFC8 independently of the probe that found it. The probe
+// inferred the offset from one value matching across sixteen offices; this
+// instruction names the offset outright while clamping it to the number the
+// window prints. Two unrelated methods agreeing is worth more than either.
+//
+// A second site does the same comparison against a copy of the field in
+// another register, at 0x751A5A. A second implementation of one rule is
+// routine in this executable - walking found the same distance written out in
+// four separate functions - so both are patched, and neither is patched
+// unless both verify. Patching one of two is how that plugin shipped two
+// versions where the simulation and the window disagreed.
+//
+// These are immediates inside instructions, not constants in .rdata, so there
+// is nothing shared to disturb: rewriting them touches these two sites and
+// nothing else in the game.
+
+#define RVA_CLAMP_CMP_A   0x74E08F   // the store, the jmp, then cmp eax,3500
+#define RVA_CLAMP_SET_A   0x74E09F   // mov [rsi+0xFC8],3500
+#define RVA_CLAMP_CMP_B   0x751A5A   // mov ecx,[r13+0xFC8] then cmp ecx,3500
+#define RVA_CLAMP_SET_B   0x751A69   // mov eax,3500
+
+static const BYTE kClampCmpA[] = {
+    0x44, 0x89, 0xA6, 0xC8, 0x0F, 0x00, 0x00,   // mov [rsi+0xFC8],r12d
+    0xEB, 0x11,                                  // jmp +0x11
+    0x3D, 0xAC, 0x0D, 0x00, 0x00                 // cmp eax,3500   <- imm at +10
+};
+static const BYTE kClampSetA[] = {
+    0xC7, 0x86, 0xC8, 0x0F, 0x00, 0x00,          // mov dword [rsi+0xFC8],
+    0xAC, 0x0D, 0x00, 0x00                       //      3500      <- imm at +6
+};
+static const BYTE kClampCmpB[] = {
+    0x41, 0x8B, 0x8D, 0xC8, 0x0F, 0x00, 0x00,   // mov ecx,[r13+0xFC8]
+    0x81, 0xF9, 0xAC, 0x0D, 0x00, 0x00           // cmp ecx,3500   <- imm at +9
+};
+static const BYTE kClampSetB[] = {
+    0xB8, 0xAC, 0x0D, 0x00, 0x00                 // mov eax,3500   <- imm at +1
+};
+
+struct ClampSite
+{
+    DWORD       rva;
+    const BYTE* expect;
+    int         len;
+    int         immOff;
+    const char* label;
+};
+
+static const ClampSite kClampSites[] = {
+    { RVA_CLAMP_CMP_A, kClampCmpA, sizeof(kClampCmpA), 10, "handler compare" },
+    { RVA_CLAMP_SET_A, kClampSetA, sizeof(kClampSetA),  6, "handler store"   },
+    { RVA_CLAMP_CMP_B, kClampCmpB, sizeof(kClampCmpB),  9, "second compare"  },
+    { RVA_CLAMP_SET_B, kClampSetB, sizeof(kClampSetB),  1, "second store"    },
+};
+#define CLAMP_SITE_COUNT (sizeof(kClampSites) / sizeof(kClampSites[0]))
+
 // SOVIETInstructions.txt:2125-2126.
 #define BT_OFFICE            12
 #define BT_OFFICE_RAIL       28
@@ -243,6 +317,10 @@ static int g_probe    = 1;      // and the first half, which is what 0.1 is for
 
 static int g_officeRange = 10000;  // metres of reach. The point of the plugin
 static int g_officeLimit = 0;      // 0 = no cap at all
+
+// Raise the office window's own ceiling so the plus button works past 3500.
+static int g_raiseCeiling = 1;
+static int g_ceiling      = 20000;
 
 // The value to hunt for in a construction office, as an int and as a float.
 //
@@ -1328,6 +1406,49 @@ static bool WriteSite(const Site* s, float* slot, double value)
     return true;
 }
 
+// All four or none. Each site individually is a short byte run that could in
+// principle occur elsewhere; what makes the set trustworthy is that three of
+// the four carry the 0xFC8 displacement and all four sit at fixed addresses in
+// this build. Verifying them together and writing only on a clean sweep is
+// also what stops the half-patched state where the simulation honours one
+// ceiling and the window draws another.
+static bool PatchClamp(void)
+{
+    for (int i = 0; i < (int)CLAMP_SITE_COUNT; i++)
+    {
+        const ClampSite* s = &kClampSites[i];
+        BYTE* at = g_exeBase + s->rva;
+
+        if (!ReadablePtr(at, (size_t)s->len))
+        {
+            Logf("construct  ceiling: rva 0x%X is not readable - refusing", s->rva);
+            return false;
+        }
+        if (memcmp(at, s->expect, (size_t)s->len) != 0)
+        {
+            char hex[96]; int o = 0;
+            for (int k = 0; k < s->len && o < 88; k++)
+                o += _snprintf_s(hex + o, sizeof(hex) - o, _TRUNCATE, "%02X ", at[k]);
+            Logf("construct  ceiling: %s at rva 0x%X does not match this build - refusing",
+                 s->label, s->rva);
+            Logf("construct           found: %s", hex);
+            return false;
+        }
+    }
+
+    for (int i = 0; i < (int)CLAMP_SITE_COUNT; i++)
+    {
+        const ClampSite* s = &kClampSites[i];
+        BYTE* imm = g_exeBase + s->rva + s->immOff;
+        if (!WriteCode(imm, &g_ceiling, sizeof(g_ceiling), s->label)) return false;
+    }
+
+    Logf("construct  ceiling: %d of %d site(s) raised from %d to %d - the office "
+         "window's + button now goes that far",
+         (int)CLAMP_SITE_COUNT, (int)CLAMP_SITE_COUNT, VANILLA_RANGE_MAX, g_ceiling);
+    return true;
+}
+
 static int PatchGroup(const Group* g, double value)
 {
     for (int i = 0; i < g->count; i++)
@@ -1392,6 +1513,8 @@ static void ReadSettings(void)
     g_probeDiff   = H->configInt(ini, "construction", "probe_diff",   g_probeDiff);
     g_writeRange  = H->configInt(ini, "construction", "write_range",  g_writeRange);
     g_gameDefault = H->configInt(ini, "construction", "game_default", g_gameDefault);
+    g_raiseCeiling = H->configInt(ini, "construction", "raise_ceiling", g_raiseCeiling);
+    g_ceiling      = H->configInt(ini, "construction", "ceiling",       g_ceiling);
     g_rdataFrom   = H->configInt(ini, "construction", "rdata_from",   g_rdataFrom);
     g_rdataTo     = H->configInt(ini, "construction", "rdata_to",     g_rdataTo);
 
@@ -1401,6 +1524,9 @@ static void ReadSettings(void)
     if (g_probePeriod < 1)        g_probePeriod = 1;
     if (g_probeSites < 0)         g_probeSites = 0;
     if (g_officeLimit < 0)        g_officeLimit = 0;
+    if (g_ceiling < VANILLA_RANGE_MAX) g_ceiling = VANILLA_RANGE_MAX;
+    if (g_ceiling > 100000)            g_ceiling = 100000;
+
     if (g_officeRange < 0)        g_officeRange = 0;
     if (g_officeRange > 20000)
     {
@@ -1468,6 +1594,11 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     }
 
     int written = 0;
+
+    // The office window's own ceiling. Independent of the site tables below -
+    // this one has real addresses and they are verified byte for byte.
+    if (g_raiseCeiling && PatchClamp()) written++;
+
     if (g_patch)
     {
         g_slot = (float*)AllocNear(g_exeBase, 64);
