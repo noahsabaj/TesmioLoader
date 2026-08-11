@@ -37,6 +37,8 @@ started with:
 | `buildings` | new buildings, written out of a config file | [13](13-buildings.md) |
 | `cities` | a per-city radius and shape | [14](14-cities.md) |
 | `daynight` | one sunrise and one sunset per calendar day | [15](15-daynight.md) |
+| `easystart` | needs that arrive with the century | [16](16-easystart.md) |
+| `construction` | a construction office's assignment cap | [17](17-construction.md) |
 
 The split is not about safety. A plugin is in the same address space and can
 corrupt the process exactly as easily as the loader can — there is no sandbox
