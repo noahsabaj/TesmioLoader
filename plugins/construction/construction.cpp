@@ -253,9 +253,21 @@ static int g_officeLimit = 0;      // 0 = no cap at all
 // beats inferring one from behaviour by a wide margin.
 //
 // 0 turns the hunt off.
-// Set office_range into every construction office, every frame. This is the
-// feature, and it is the one thing in this plugin that writes to the game.
+// Set office_range into a construction office. This is the feature, and it is
+// the one thing in this plugin that writes to the game.
 static int g_writeRange = 1;
+
+// What a construction office starts life at, in the base game. An office still
+// carrying this has not been touched by the player, and is the only kind this
+// plugin raises - which is what makes office_range a DEFAULT rather than a
+// value the plugin holds you to.
+//
+// 0 means "no such test": every office is held at office_range every frame,
+// and the minus button in its window then cannot lower it, because the next
+// frame puts the value straight back. That was version 0.1's behaviour and it
+// was wrong - it was insurance against a re-clamp the game turns out not to
+// do.
+static int g_gameDefault = 1000;
 
 static int g_probeExpect = 3500;
 
@@ -689,19 +701,39 @@ static void WriteRanges(void)
             continue;
         }
 
+        // A DEFAULT, NOT A CAGE. Only an office still carrying the game's own
+        // starting value is raised; one the player has set to anything else is
+        // theirs and is left alone. Without this the minus button in the office
+        // window is unusable - the click lands, and the next frame puts our
+        // value back, which reads as the number flickering and refusing to
+        // move.
+        //
+        // The test is the value rather than a list of offices we have already
+        // seen, because a value survives a save and reload and a pointer does
+        // not: an office the player set to 2000 comes back as 2000 and is still
+        // recognisably not the default.
+        if (g_gameDefault > 0 && now != g_gameDefault) continue;
+
         // Anything other than the value we last put here, when we have written
         // before, is the game putting it back.
-        if (g_wroteOnce && now != g_officeRange) clamped++;
+        if (g_wroteOnce && g_gameDefault <= 0 && now != g_officeRange) clamped++;
 
         *(int*)(b + B_OFFICE_RANGE) = g_officeRange;
         wrote++;
     }
 
-    if (wrote && !g_wroteOnce)
+    // One line per office raised, which is once each: the next pass sees our
+    // own value and skips it. A newly built office therefore announces itself.
+    if (wrote)
     {
-        Logf("construct  range: wrote %d m into %d office(s) at +0x%X - the game's own "
-             "interface stops at %d", g_officeRange, wrote, B_OFFICE_RANGE,
-             VANILLA_RANGE_MAX);
+        if (g_gameDefault > 0)
+            Logf("construct  range: %d office(s) at the game's default of %d raised to "
+                 "%d m - lower any of them in its own window and it stays lowered",
+                 wrote, g_gameDefault, g_officeRange);
+        else
+            Logf("construct  range: holding %d office(s) at %d m - `game_default = 0`, "
+                 "so the minus button in the office window cannot lower them",
+                 wrote, g_officeRange);
         g_wroteOnce = 1;
     }
 
@@ -1359,6 +1391,7 @@ static void ReadSettings(void)
     g_probeExpect = H->configInt(ini, "construction", "probe_expect", g_probeExpect);
     g_probeDiff   = H->configInt(ini, "construction", "probe_diff",   g_probeDiff);
     g_writeRange  = H->configInt(ini, "construction", "write_range",  g_writeRange);
+    g_gameDefault = H->configInt(ini, "construction", "game_default", g_gameDefault);
     g_rdataFrom   = H->configInt(ini, "construction", "rdata_from",   g_rdataFrom);
     g_rdataTo     = H->configInt(ini, "construction", "rdata_to",     g_rdataTo);
 
@@ -1453,9 +1486,13 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         return 1;
     }
 
-    if (g_writeRange)
-        Logf("construct  ready: office range will be held at %d m (the game's own "
-             "interface stops at %d)", g_officeRange, VANILLA_RANGE_MAX);
+    if (g_writeRange && g_gameDefault > 0)
+        Logf("construct  ready: a construction office starting at the game's %d m will "
+             "be set to %d m (its own window stops at %d, and lowering one by hand "
+             "sticks)", g_gameDefault, g_officeRange, VANILLA_RANGE_MAX);
+    else if (g_writeRange)
+        Logf("construct  ready: every office held at %d m - `game_default = 0`, so they "
+             "cannot be lowered by hand", g_officeRange);
     else
         Logf("construct  ready: probe %s, writing nothing",
              armed ? "armed" : "off");
