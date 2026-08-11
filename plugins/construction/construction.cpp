@@ -133,6 +133,23 @@
 #define B_PARKING            0xCC0      // vector<ParkingConnection>, stride 0xF0
 #define T_BUILDING_TYPE      0x360      // the BUILDINGTYPE_* number
 
+// THE AUTO-SEARCH RANGE, in whole metres, as an int.
+//
+// Found by the probe rather than by disassembly, and the evidence is about as
+// good as this kind of thing gets: on a map carrying sixteen construction
+// offices, the value the office window prints - 3500 - occurs at exactly ONE
+// offset in the office object, the same offset in all sixteen, and nowhere in
+// the type descriptor. A coincidence does not survive sixteen independent
+// objects agreeing.
+//
+// It is an int and not a float, which is worth knowing: the UI prints whole
+// metres and the field stores them.
+#define B_OFFICE_RANGE       0xFC8
+
+// What the game's own interface will wind it to, and the number the whole
+// plugin exists to get past.
+#define VANILLA_RANGE_MAX    3500
+
 // SOVIETInstructions.txt:2125-2126.
 #define BT_OFFICE            12
 #define BT_OFFICE_RAIL       28
@@ -236,6 +253,10 @@ static int g_officeLimit = 0;      // 0 = no cap at all
 // beats inferring one from behaviour by a wide margin.
 //
 // 0 turns the hunt off.
+// Set office_range into every construction office, every frame. This is the
+// feature, and it is the one thing in this plugin that writes to the game.
+static int g_writeRange = 1;
+
 static int g_probeExpect = 3500;
 
 // Report every 4-byte slot of an office that changed since the last report,
@@ -617,6 +638,86 @@ static int ScanOffice(BYTE* b, DWORD extent, BYTE** bvBegin, int bvCount,
         }
     }
     return found;
+}
+
+// ---------------------------------------------------------------- writing it
+//
+// The range is a plain int on the office, so the first thing to try is simply
+// setting it - no spliced code, no repointed constant, nothing that a game
+// update can move. `cities` does the same kind of thing for a city's radius.
+//
+// Whether it STICKS is the open question, and this is also the experiment that
+// answers it: the value is written, read back on the next pass, and any
+// disagreement is reported. If the simulation clamps it to 3500 the log says
+// so in as many words, and the answer is then a code patch on whatever does
+// the clamping.
+//
+// This is the one place in the plugin that writes to the game. It is off
+// unless `write_range` says otherwise, and it refuses an office whose current
+// value is not a plausible range - if 0xFC8 ever stops being this field, that
+// guard is what stops the plugin writing into a stranger's structure.
+
+static int  g_wroteOnce;
+static int  g_clampReported;
+
+static void WriteRanges(void)
+{
+    if (!g_writeRange || g_officeRange <= 0) return;
+
+    int wrote = 0, clamped = 0, refused = 0;
+
+    for (int i = 0; i < g_offices; i++)
+    {
+        BYTE* b = g_office[i].building;
+        if (!b) continue;
+
+        // Still an office, and still readable. The building vector is walked
+        // fresh every report, but this runs between reports too.
+        int t = BuildingType(b);
+        if (t != BT_OFFICE && t != BT_OFFICE_RAIL) continue;
+        if (!ReadablePtr(b + B_OFFICE_RANGE, 4)) continue;
+
+        int now = *(const int*)(b + B_OFFICE_RANGE);
+        if (now == g_officeRange) continue;             // already ours
+
+        // The invariant that keeps a wrong offset from becoming a wild write:
+        // whatever is here has to look like a range in metres. The game's own
+        // values run to 3500 and the plugin's own ceiling is 20000.
+        if (now < 100 || now > 20000)
+        {
+            refused++;
+            continue;
+        }
+
+        // Anything other than the value we last put here, when we have written
+        // before, is the game putting it back.
+        if (g_wroteOnce && now != g_officeRange) clamped++;
+
+        *(int*)(b + B_OFFICE_RANGE) = g_officeRange;
+        wrote++;
+    }
+
+    if (wrote && !g_wroteOnce)
+    {
+        Logf("construct  range: wrote %d m into %d office(s) at +0x%X - the game's own "
+             "interface stops at %d", g_officeRange, wrote, B_OFFICE_RANGE,
+             VANILLA_RANGE_MAX);
+        g_wroteOnce = 1;
+    }
+
+    if (refused)
+        Logf("construct  range: %d office(s) refused - +0x%X did not hold a plausible "
+             "range, so it is not being written", refused, B_OFFICE_RANGE);
+
+    // Reported once rather than every frame: if the game is putting it back,
+    // it is putting it back constantly and one line says everything.
+    if (clamped && !g_clampReported)
+    {
+        Logf("construct  range: the game put %d office(s) back - the field is being "
+             "re-clamped, so setting it is not enough and the clamp has to be "
+             "patched. This is the answer to the open question.", clamped);
+        g_clampReported = 1;
+    }
 }
 
 // ---------------------------------------------------------------- the hunt
@@ -1054,6 +1155,13 @@ static void Tick(void)
     int    bvCount = Buildings(game, &bvBegin);
     if (bvCount <= 0) return;                   // no world loaded yet
 
+    // Every frame, and deliberately not once per report: if the game re-clamps
+    // this field then holding it only every five seconds would leave it at the
+    // game's own value almost all the time, and the auto-search would hardly
+    // ever run with ours in place. It works off the office list the last report
+    // gathered, so it costs one type check and one compare per office.
+    WriteRanges();
+
     DWORD now = GetTickCount();
     if (g_armed && now - g_lastReport < (DWORD)g_probePeriod * 1000) return;
     g_lastReport = now;
@@ -1222,12 +1330,13 @@ static void h_TerrainRender(void* self, bool a, void* cam1, void* cam2, int b, i
 {
     o_TerrainRender(self, a, cam1, cam2, b, c);
 
-    if (!g_probe) return;
+    if (!g_probe && !g_writeRange) return;
     __try { Tick(); }
     __except (FaultFilter("construction probe", GetExceptionInformation()))
     {
-        Logf("construct  probe disabled after a fault - the game is untouched");
-        g_probe = 0;
+        Logf("construct  disabled after a fault - the range is left as the game had it");
+        g_probe      = 0;
+        g_writeRange = 0;
     }
 }
 
@@ -1249,6 +1358,7 @@ static void ReadSettings(void)
     g_probeSites  = H->configInt(ini, "construction", "probe_sites",  g_probeSites);
     g_probeExpect = H->configInt(ini, "construction", "probe_expect", g_probeExpect);
     g_probeDiff   = H->configInt(ini, "construction", "probe_diff",   g_probeDiff);
+    g_writeRange  = H->configInt(ini, "construction", "write_range",  g_writeRange);
     g_rdataFrom   = H->configInt(ini, "construction", "rdata_from",   g_rdataFrom);
     g_rdataTo     = H->configInt(ini, "construction", "rdata_to",     g_rdataTo);
 
@@ -1343,8 +1453,12 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         return 1;
     }
 
-    Logf("construct  ready: probe %s, %d site(s) patched",
-         armed ? "armed - it reads the offices and changes nothing" : "off", written);
+    if (g_writeRange)
+        Logf("construct  ready: office range will be held at %d m (the game's own "
+             "interface stops at %d)", g_officeRange, VANILLA_RANGE_MAX);
+    else
+        Logf("construct  ready: probe %s, writing nothing",
+             armed ? "armed" : "off");
     return 0;
 }
 
