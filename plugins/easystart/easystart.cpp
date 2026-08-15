@@ -554,18 +554,25 @@ static void SyncYear(BYTE* game)
     char line[512];
     int  n = _snprintf_s(line, sizeof(line), _TRUNCATE,
                          "easystart  year %d, still to come:", year);
+    // _snprintf_s returns -1 when _TRUNCATE truncates. Accumulating that walks
+    // the offset backwards and the next append overwrites the character before
+    // it - so the result is checked, and a truncated append ends the list.
     int  any = 0;
     for (int i = 0; i < NEED_COUNT && n > 0 && n < (int)sizeof(line) - 24; i++)
         if (g_locked[i])
         {
             any = 1;
-            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, " %s", kNeeds[i].key);
+            int k = _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, " %s", kNeeds[i].key);
+            if (k < 0) break;
+            n += k;
         }
     for (int i = 0; i < g_modCount && n > 0 && n < (int)sizeof(line) - 56; i++)
         if (year < g_mod[i].year)
         {
             any = 1;
-            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, " %s", g_mod[i].name);
+            int k = _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, " %s", g_mod[i].name);
+            if (k < 0) break;
+            n += k;
         }
 
     if (any) Logf("%s", line);
@@ -828,8 +835,10 @@ static void DumpWatch(void* game)
             int         kind = *(const int*)(d + DEMAND_KIND);
             int         mod  = 0;
             int         need = NeedOfDemand((BYTE*)game, d, &mod);
-            off += _snprintf_s(buf + off, sizeof(buf) - off, _TRUNCATE,
-                               " [%d]kind%d/need%d", k, kind, need);
+            int w = _snprintf_s(buf + off, sizeof(buf) - off, _TRUNCATE,
+                                " [%d]kind%d/need%d", k, kind, need);
+            if (w < 0) break;      // _TRUNCATE returns -1; never accumulate it
+            off += w;
         }
         const float* s = (const float*)(p + PERSON_STATUS);
         Logf("easystart  probe  watch[%d] %p (building %p): %d demand(s)%s "

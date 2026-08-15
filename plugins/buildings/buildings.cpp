@@ -236,6 +236,9 @@ static unsigned long long HashStr(unsigned long long h, const char* s)
 // $brick` yields the keyword and not the argument.
 static bool FirstToken(const char* line, char* out, size_t n)
 {
+    // n < 2 has no room for even "$" and its terminator, and the unconditional
+    // out[i++] = '$' below would write past the end of a one-byte buffer.
+    if (!out || n < 2) return false;
     out[0] = 0;
     const char* p = strchr(line, '$');
     if (!p) return false;

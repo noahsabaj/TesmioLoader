@@ -995,15 +995,20 @@ static void h_Dispatch(void* game)
 
 // ---------------------------------------------------------------- plumbing
 
+// "18,19" - and "18 19", and "18, 19", and any mixture. The separator set has
+// to be the same on both sides of a number: the skip loop below accepted space,
+// comma and tab, while the advance loop only stopped at a comma - so a
+// space-separated list ran to the end of the string after the first value and
+// every type but the first was silently dropped.
 static void ParseTypes(const char* s)
 {
     g_typeCount = 0;
-    while (*s && g_typeCount < 8)
+    while (*s && g_typeCount < (int)(sizeof(g_types) / sizeof(g_types[0])))
     {
         while (*s == ' ' || *s == ',' || *s == '\t') s++;
         if (!*s) break;
         g_types[g_typeCount++] = atoi(s);
-        while (*s && *s != ',') s++;
+        while (*s && *s != ',' && *s != ' ' && *s != '\t') s++;
     }
 }
 

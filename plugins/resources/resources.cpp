@@ -1143,26 +1143,60 @@ static bool MarkSeen(const char* name)
 typedef unsigned __int64 (*t_ResourceGet)(void*, void*, void*, void*);
 static t_ResourceGet o_ResourceGet;
 
+// A row is a fixed shape - "  +0FF  " then 16 hex pairs then a gap then 16
+// characters then CRLF - so it is placed rather than printed. That is both
+// faster than eighteen calls to _snprintf_s per line and immune to the two
+// traps the printed version had: _TRUNCATE returns -1 rather than a length, so
+// an accumulated offset could run backwards, and a length that came out
+// negative was handed straight to WriteTo, whose DWORD cast turns -1 into a
+// four-gigabyte write.
 static void HexDump(HANDLE h, const char* label, const BYTE* p, size_t n)
 {
+    static const char kHex[] = "0123456789ABCDEF";
+
     char head[128];
     int k = _snprintf_s(head, sizeof(head), _TRUNCATE, "\r\n%s  @ %p\r\n", label, p);
+    if (k < 0) k = (int)strlen(head);          // truncated: write what fitted
     WriteTo(h, head, k);
 
     for (size_t off = 0; off < n; off += 16)
     {
-        char line[160];
-        int o = _snprintf_s(line, sizeof(line), _TRUNCATE, "  +%03zX  ", off);
-        for (size_t i = 0; i < 16; i++)
-            o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE, "%02X ", p[off + i]);
-        o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE, " ");
+        // A dump whose length is not a multiple of 16 has a short last row.
+        // Reading a full sixteen regardless is how this used to run up to
+        // fifteen bytes past the end of the buffer it was given; the missing
+        // columns are blanked instead, so everything still lines up.
+        size_t row = (n - off) < 16 ? (n - off) : 16;
+
+        // 8 + 48 + 1 + 16 + 2 = 75 for a normal row. 128 rather than 80 so the
+        // "+%03zX" field can grow past three digits on a large dump without the
+        // fixed placement below having to think about it.
+        char line[128];
+        int  o = 0;
+
+        int w = _snprintf_s(line, sizeof(line), _TRUNCATE, "  +%03zX  ", off);
+        o = (w < 0) ? (int)strlen(line) : w;
+
         for (size_t i = 0; i < 16; i++)
         {
-            BYTE c = p[off + i];
-            o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE, "%c",
-                             (c >= 32 && c < 127) ? (char)c : '.');
+            if (i < row)
+            {
+                BYTE b = p[off + i];
+                line[o++] = kHex[b >> 4];
+                line[o++] = kHex[b & 0x0F];
+            }
+            else { line[o++] = ' '; line[o++] = ' '; }
+            line[o++] = ' ';
         }
-        o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE, "\r\n");
+        line[o++] = ' ';
+
+        for (size_t i = 0; i < row; i++)
+        {
+            BYTE c = p[off + i];
+            line[o++] = (c >= 32 && c < 127) ? (char)c : '.';
+        }
+
+        line[o++] = '\r';
+        line[o++] = '\n';
         WriteTo(h, line, o);
     }
 }

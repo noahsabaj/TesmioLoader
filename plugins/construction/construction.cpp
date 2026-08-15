@@ -1,20 +1,40 @@
 // construction - how far a construction office reaches for work, as a
 // tesmioloader plugin.
 //
-// THE FEATURE: a construction office only picks up jobs near itself. This is
-// meant to make that reach configurable - `office_range` in the ini, 10 km by
-// default - so an office serves a whole district instead of a few streets.
+// THE FEATURE: a construction office only picks up jobs near itself.
+// `office_range` in the ini - 10 km by default - makes that reach yours, so an
+// office serves a whole district instead of a few streets.
 //
-// STATE: THE RANGE HAS NOT BEEN FOUND YET, so this release cannot change it.
-// What is here is the half that finds it: the probe brackets the range by
-// watching which sites an office takes and which it refuses, then hunts the
-// executable for a number in that bracket. `patch` is 0 and both site tables
-// are empty; a table of zeroes logs "no address yet" rather than refusing,
-// which is the right way round for a plugin whose first release is a question.
+// STATE: THE RANGE IS FOUND AND THE FEATURE WORKS. It turned out to be a plain
+// int on the office object, at +0xFC8 (B_OFFICE_RANGE below) - the very number
+// the office's own window prints as "<3,500m". So there is no spliced code and
+// no repointed constant in the feature at all: WriteRanges simply sets the
+// field, which is as robust as a patch in this project gets. Confirmed in a
+// running game - a site ~9 km out is picked up and the road overlay matches -
+// and the simulation does not clamp the value back.
 //
-// A count cap is the other thing the limit could be - an office that stops at
-// N jobs however close they are - so the probe measures both and keeps them in
-// separate tables, because finding one must not block patching the other.
+// Two smaller pieces sit either side of it:
+//
+//   the window ceiling  the office window's + button stopped at 3500 because
+//                       of imm32 clamps and a fixed rung ladder baked into the
+//                       button handlers. PatchClamp raises the top rung, so
+//                       the range stays adjustable by hand past the default.
+//                       Seven sites, all verified before any is written.
+//   the probe           still here, still useful, and now purely diagnostic:
+//                       it is what found +0xFC8 and it is what would find the
+//                       field again after a game update moved it.
+//
+// The kRangeSites/kLimitSites tables below are still empty, and deliberately:
+// they are the *code-patch* route, which the field write made unnecessary. A
+// table of zeroes logs "no address yet" rather than refusing, so `patch = 1`
+// on an empty table does nothing instead of complaining about a build that is
+// fine. They stay because a future game version might make the field read-only
+// and force the issue back to a code patch.
+//
+// A count cap is the other thing the limit could have been - an office that
+// stops at N jobs however close they are - so the probe measures both and
+// keeps them in separate tables, because finding one must not block patching
+// the other.
 //
 //
 // WHAT AUTOMATIC ASSIGNMENT IS
@@ -149,6 +169,14 @@
 // What the game's own interface will wind it to, and the number the whole
 // plugin exists to get past.
 #define VANILLA_RANGE_MAX    3500
+
+// The largest range this plugin will set or accept as plausible. The same
+// ceiling plugins/walking uses, for the same reason: these searches are
+// breadth-first over the road graph, so the work grows with the square of the
+// limit. It bounds `office_range`, and it is also the upper half of the
+// "does +0xFC8 still hold something that looks like a range" invariant in
+// WriteRanges - one constant so the two can never drift apart.
+#define RANGE_MAX            20000
 
 // --- the ceiling, and where it is written down ----------------------------
 //
@@ -363,8 +391,12 @@ static int g_officeRange = 10000;  // metres of reach. The point of the plugin
 static int g_officeLimit = 0;      // 0 = no cap at all
 
 // Raise the office window's own ceiling so the plus button works past 3500.
+//
+// The default matches g_officeRange deliberately, and construction.ini says to
+// keep them equal: then the highest the + button reaches is the value a newly
+// built office already starts at, and the menu and the config tell one story.
 static int g_raiseCeiling = 1;
-static int g_ceiling      = 20000;
+static int g_ceiling      = 10000;
 
 // The value to hunt for in a construction office, as an int and as a float.
 //
@@ -455,6 +487,7 @@ struct Office
     int   raised;       // decided about once, and never reconsidered
     int   hunted;       // the value hunt is done once per office, not per report
     int   haveSnap;
+    DWORD snapLen;      // how much of `snap` the last snapshot actually filled
     BYTE  snap[OFFICE_SNAP];
 };
 
@@ -582,6 +615,10 @@ static bool BuildingCentre(BYTE* b, float* out)
     if (!p) return false;
     out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
 
+    // B_TYPEDESC is a lower offset than B_BBOX but that does not make it
+    // readable: a heap object can end anywhere, and the check above asked only
+    // about +0x5D0. Ask about this one too rather than inferring it.
+    if (!ReadablePtr(b + B_TYPEDESC, 8)) return true;
     if (*(void**)(b + B_TYPEDESC) != NULL) return true;
 
     BYTE* bb = *(BYTE**)(b + B_BBOX);
@@ -794,6 +831,7 @@ static int ScanOffice(BYTE* b, DWORD extent, BYTE** bvBegin, int bvCount,
 
 static int  g_wroteOnce;
 static int  g_clampReported;
+static int  g_refusedReported;
 
 static void WriteRanges(void)
 {
@@ -807,16 +845,24 @@ static void WriteRanges(void)
         BYTE*   b = o->building;
         if (!b) continue;
 
-        // Decided once, and never reconsidered. This is the fix for a bug that
-        // was mine: the rule used to be "raise anything sitting at the game's
-        // default", and the minus button's own bottom rung IS that default. So
-        // stepping an office down to 1000 by hand looked identical to a
-        // freshly built one, and the plugin put it straight back to 10000 -
-        // which made the minus button cycle 3500, 3000, 2000, 10000 for ever.
+        // Decided once, and never reconsidered - but ONLY in default mode.
         //
-        // "Have we already made a decision about this office" is the honest
-        // question, and the value alone could never answer it.
-        if (o->raised) continue;
+        // This is the fix for a bug that was mine: the rule used to be "raise
+        // anything sitting at the game's default", and the minus button's own
+        // bottom rung IS that default. So stepping an office down to 1000 by
+        // hand looked identical to a freshly built one, and the plugin put it
+        // straight back to 10000 - which made the minus button cycle 3500,
+        // 3000, 2000, 10000 for ever. "Have we already made a decision about
+        // this office" is the honest question, and the value alone could never
+        // answer it.
+        //
+        // With `game_default = 0` there is no such question to ask: the
+        // documented behaviour there is that every office is HELD at
+        // office_range on every frame, so the flag must not short-circuit it.
+        // It used to, unconditionally, which quietly made game_default = 0
+        // behave identically to the default mode - and took the re-clamp
+        // detection below down with it, since a raised office never reached it.
+        if (g_gameDefault > 0 && o->raised) continue;
 
         // Still an office, and still readable. The building vector is walked
         // fresh every report, but this runs between reports too.
@@ -829,8 +875,8 @@ static void WriteRanges(void)
 
         // The invariant that keeps a wrong offset from becoming a wild write:
         // whatever is here has to look like a range in metres. The game's own
-        // values run to 3500 and the plugin's own ceiling is 20000.
-        if (now < 100 || now > 20000)
+        // values run to 3500 and the plugin's own ceiling is RANGE_MAX.
+        if (now < 100 || now > RANGE_MAX)
         {
             refused++;
             continue;
@@ -846,41 +892,59 @@ static void WriteRanges(void)
             continue;
         }
 
-        // Anything other than the value we last put here, when we have written
-        // before, is the game putting it back.
-        if (g_wroteOnce && g_gameDefault <= 0 && now != g_officeRange) clamped++;
+        // Holding mode only: anything other than the value we last put here is
+        // the game putting it back. Reachable now that `raised` no longer skips
+        // the office on every pass after the first.
+        if (g_wroteOnce && g_gameDefault <= 0) clamped++;
 
         *(int*)(b + B_OFFICE_RANGE) = g_officeRange;
         o->raised = 1;
         wrote++;
     }
 
-    // One line per office raised, which is once each: the next pass sees our
-    // own value and skips it. A newly built office therefore announces itself.
+    // In default mode this is one line per office raised, which is once each:
+    // the next pass sees our own value and skips it, so a newly built office
+    // announces itself and nothing else does.
+    //
+    // In holding mode the write happens on EVERY frame the player has moved the
+    // value, so the same line would run at frame rate. It is said once - the
+    // behaviour does not change, and one line describes all of it.
     if (wrote)
     {
         if (g_gameDefault > 0)
             Logf("construct  range: %d office(s) at the game's default of %d raised to "
                  "%d m - lower any of them in its own window and it stays lowered",
                  wrote, g_gameDefault, g_officeRange);
-        else
+        else if (!g_wroteOnce)
             Logf("construct  range: holding %d office(s) at %d m - `game_default = 0`, "
                  "so the minus button in the office window cannot lower them",
                  wrote, g_officeRange);
         g_wroteOnce = 1;
     }
 
-    if (refused)
+    // Rate-limited for the same reason: a wrong offset is wrong on every frame,
+    // and one line says so as well as ten thousand would.
+    if (refused && !g_refusedReported)
+    {
         Logf("construct  range: %d office(s) refused - +0x%X did not hold a plausible "
-             "range, so it is not being written", refused, B_OFFICE_RANGE);
+             "range (100..%d), so it is not being written",
+             refused, B_OFFICE_RANGE, RANGE_MAX);
+        g_refusedReported = 1;
+    }
 
-    // Reported once rather than every frame: if the game is putting it back,
-    // it is putting it back constantly and one line says everything.
+    // Holding mode only, and reported once rather than every frame: whatever is
+    // moving the field is moving it constantly, and one line says everything.
+    //
+    // It does NOT say "the game re-clamped it" any more, because in this mode it
+    // cannot tell that from the player pressing the minus button - both show up
+    // as a value that is not ours, on the very next frame. Which one it is, is
+    // exactly what the reader knows and this code does not.
     if (clamped && !g_clampReported)
     {
-        Logf("construct  range: the game put %d office(s) back - the field is being "
-             "re-clamped, so setting it is not enough and the clamp has to be "
-             "patched. This is the answer to the open question.", clamped);
+        Logf("construct  range: %d office(s) had a value other than %d and were put "
+             "back - `game_default = 0`, so every office is held on every frame. "
+             "If you did not change it by hand, the game is re-clamping the field "
+             "and setting it is not enough.", clamped, g_officeRange);
         g_clampReported = 1;
     }
 }
@@ -929,9 +993,15 @@ static void DiffOffice(Office* o, DWORD extent)
     if (!o->haveSnap)
     {
         memcpy(o->snap, o->building, to);
+        o->snapLen  = to;
         o->haveSnap = 1;
         return;
     }
+
+    // Only compare what the PREVIOUS snapshot actually covered. A readability
+    // bound can grow between reports, and the bytes past the old bound are
+    // still zero - every one of which would be printed as a slot that "moved".
+    if (to > o->snapLen) to = o->snapLen;
 
     int printed = 0;
     for (DWORD off = (DWORD)g_probeFrom; off + 4 <= to && printed < 24; off += 4)
@@ -957,7 +1027,11 @@ static void DiffOffice(Office* o, DWORD extent)
     if (!printed)
         Logf("construct      nothing that looks like a distance moved");
 
-    memcpy(o->snap, o->building, to);
+    // Re-snapshot the whole of what is readable NOW, not the clamped compare
+    // window - otherwise a bound that grew once could never be caught up with.
+    DWORD fresh = extent < OFFICE_SNAP ? extent : OFFICE_SNAP;
+    memcpy(o->snap, o->building, fresh);
+    o->snapLen = fresh;
 }
 
 // ---------------------------------------------------------------- the probe
@@ -975,11 +1049,19 @@ static void TypeHistogram(BYTE** begin, int count)
         else unknown++;
     }
 
+    // _snprintf_s returns -1 when _TRUNCATE truncates, so the running offset has
+    // to be checked rather than accumulated blind: `o += -1` walks backwards and
+    // the next write lands before the start of the buffer.
     char line[1024];
     int  o = 0;
-    for (int t = 0; t < MAX_TYPE && o < 900; t++)
+    for (int t = 0; t < MAX_TYPE && o < (int)sizeof(line) - 24; t++)
         if (hist[t])
-            o += _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE, "%d x%d  ", t, hist[t]);
+        {
+            int k = _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE,
+                                "%d x%d  ", t, hist[t]);
+            if (k < 0) break;
+            o += k;
+        }
     line[o] = 0;
 
     Logf("construct  %d building(s), %d with no readable type", count, unknown);
@@ -995,14 +1077,30 @@ static void TypeHistogram(BYTE** begin, int count)
              BT_OFFICE, BT_OFFICE_RAIL, T_BUILDING_TYPE);
 }
 
+static int g_overflowReported;
+
 static int CollectOffices(BYTE** begin, int count)
 {
-    int n = 0;
-    for (int i = 0; i < count && n < MAX_OFFICES; i++)
+    int n = 0, total = 0;
+    for (int i = 0; i < count; i++)
     {
         BYTE* b = begin[i];
         int   t = BuildingType(b);
         if (t != BT_OFFICE && t != BT_OFFICE_RAIL) continue;
+
+        // Counted before the cap so the overflow below is the real number, not
+        // MAX_OFFICES. A map with more offices than fit used to lose the rest
+        // in silence - including for WriteRanges, so those offices simply never
+        // got their range set and nothing said why.
+        total++;
+        if (n >= MAX_OFFICES)
+        {
+            // Once the overflow has been said, there is nothing left to learn
+            // from counting the rest - and BuildingType is two VirtualQuery
+            // calls per building on a vector that can hold thousands.
+            if (g_overflowReported) break;
+            continue;
+        }
 
         // Carry forward what we already learned about this office rather than
         // starting over: the accepted offset and the previous count are the
@@ -1015,6 +1113,15 @@ static int CollectOffices(BYTE** begin, int count)
         keep.building = b;
         keep.type     = t;
         g_office[n++] = keep;
+    }
+
+    if (total > MAX_OFFICES && !g_overflowReported)
+    {
+        Logf("construct  WARN this map has %d construction offices and only %d fit - "
+             "the other %d are not probed and their range is NOT set. Raise "
+             "MAX_OFFICES and rebuild if you need them all.",
+             total, MAX_OFFICES, total - MAX_OFFICES);
+        g_overflowReported = 1;
     }
     return n;
 }
@@ -1041,7 +1148,9 @@ static void ReportOffice(Office* o, BYTE** bvBegin, int bvCount, int* claimedBy)
         Logf("construct    hunting %d in this office", g_probeExpect);
         int hits = FindValue(b, extent, g_probeExpect, "office");
 
-        BYTE* td = *(BYTE**)(b + B_TYPEDESC);
+        // extent can stop short of B_TYPEDESC, so the slot holding the type
+        // record has to be checked before it is read, not just the record.
+        BYTE* td = ReadablePtr(b + B_TYPEDESC, 8) ? *(BYTE**)(b + B_TYPEDESC) : NULL;
         if (td && ReadablePtr(td, 0x900))
             hits += FindValue(td, 0x900, g_probeExpect, "type  ");
 
@@ -1275,7 +1384,8 @@ static void Report(BYTE* game, BYTE** bvBegin, int bvCount)
                 DWORD extent = ReadableExtent(o->building, (DWORD)g_probeTo);
                 hits += ScanFloatRange(o->building, 0, extent, wlo, whi, "office ", 12);
 
-                BYTE* td = *(BYTE**)(o->building + B_TYPEDESC);
+                BYTE* td = ReadablePtr(o->building + B_TYPEDESC, 8)
+                         ? *(BYTE**)(o->building + B_TYPEDESC) : NULL;
                 if (td) hits += ScanFloatRange(td, 0, 0x900, wlo, whi, "type   ", 12);
 
                 hits += ScanFloatRange(game, 0, 0x14000, wlo, whi, "game   ", 12);
@@ -1461,12 +1571,17 @@ static bool WriteSite(const Site* s, float* slot, double value)
     return true;
 }
 
-// All four or none. Each site individually is a short byte run that could in
-// principle occur elsewhere; what makes the set trustworthy is that three of
-// the four carry the 0xFC8 displacement and all four sit at fixed addresses in
-// this build. Verifying them together and writing only on a clean sweep is
-// also what stops the half-patched state where the simulation honours one
-// ceiling and the window draws another.
+// All seven or none - four validator sites and the three rungs the buttons
+// actually walk. Each site individually is a short byte run that could in
+// principle occur elsewhere; what makes the set trustworthy is that four of
+// the seven carry the 0xFC8 displacement and all of them sit at fixed
+// addresses in this build. Verifying them together and writing only on a clean
+// sweep is also what stops the half-patched state where the validator honours
+// one ceiling and the button ladder stops at another.
+//
+// The write loop is deliberately after the whole verify loop. A VirtualProtect
+// that fails partway still leaves earlier sites written, which is why the
+// failure is logged loudly rather than returned quietly.
 static bool PatchClamp(void)
 {
     for (int i = 0; i < (int)CLAMP_SITE_COUNT; i++)
@@ -1482,8 +1597,13 @@ static bool PatchClamp(void)
         if (memcmp(at, s->expect, (size_t)s->len) != 0)
         {
             char hex[96]; int o = 0;
-            for (int k = 0; k < s->len && o < 88; k++)
-                o += _snprintf_s(hex + o, sizeof(hex) - o, _TRUNCATE, "%02X ", at[k]);
+            for (int k = 0; k < s->len && o < (int)sizeof(hex) - 4; k++)
+            {
+                int w = _snprintf_s(hex + o, sizeof(hex) - o, _TRUNCATE, "%02X ", at[k]);
+                if (w < 0) break;              // _TRUNCATE returns -1, never add it
+                o += w;
+            }
+            hex[o] = 0;
             Logf("construct  ceiling: %s at rva 0x%X does not match this build - refusing",
                  s->label, s->rva);
             Logf("construct           found: %s", hex);
@@ -1495,7 +1615,18 @@ static bool PatchClamp(void)
     {
         const ClampSite* s = &kClampSites[i];
         BYTE* imm = g_exeBase + s->rva + s->immOff;
-        if (!WriteCode(imm, &g_ceiling, sizeof(g_ceiling), s->label)) return false;
+        if (!WriteCode(imm, &g_ceiling, sizeof(g_ceiling), s->label))
+        {
+            // Every site verified, so this is a VirtualProtect failure and not
+            // a wrong build - and the ones before it are already written. Say
+            // so outright: a half-raised ceiling is a state worth knowing about
+            // rather than a quiet "did not patch".
+            Logf("construct  ceiling: FAILED writing \"%s\" (site %d of %d) - %d "
+                 "earlier site(s) ARE already raised to %d. The office window may "
+                 "now disagree with itself; restart the game to undo it.",
+                 s->label, i + 1, (int)CLAMP_SITE_COUNT, i, g_ceiling);
+            return false;
+        }
     }
 
     Logf("construct  ceiling: %d of %d site(s) raised from %d to %d - the office "
@@ -1579,18 +1710,25 @@ static void ReadSettings(void)
     if (g_probePeriod < 1)        g_probePeriod = 1;
     if (g_probeSites < 0)         g_probeSites = 0;
     if (g_officeLimit < 0)        g_officeLimit = 0;
+    // Below 3500 the "ceiling" would be a restriction rather than a lift.
+    // Above RANGE_MAX it would be a trap: the player could wind an office up
+    // past the value WriteRanges accepts as a plausible range, and the plugin
+    // would then start refusing that office as if +0xFC8 had stopped being the
+    // field. One bound for both, so that cannot happen.
     if (g_ceiling < VANILLA_RANGE_MAX) g_ceiling = VANILLA_RANGE_MAX;
-    if (g_ceiling > 100000)            g_ceiling = 100000;
+    if (g_ceiling > RANGE_MAX)
+    {
+        Logf("construct  ceiling %d is past the %d limit - clamped",
+             g_ceiling, RANGE_MAX);
+        g_ceiling = RANGE_MAX;
+    }
 
     if (g_officeRange < 0)        g_officeRange = 0;
-    if (g_officeRange > 20000)
+    if (g_officeRange > RANGE_MAX)
     {
-        // The same ceiling plugins/walking uses, for the same reason: these
-        // searches are breadth-first over the road graph, so the work grows
-        // with the square of the limit.
-        Logf("construct  office_range %d is past the 20000 ceiling - clamped",
-             g_officeRange);
-        g_officeRange = 20000;
+        Logf("construct  office_range %d is past the %d ceiling - clamped",
+             g_officeRange, RANGE_MAX);
+        g_officeRange = RANGE_MAX;
     }
     if (g_rdataFrom < 0)          g_rdataFrom = 0;
     if (g_rdataTo <= g_rdataFrom) g_rdataTo = g_rdataFrom + 0x1000;
@@ -1605,7 +1743,7 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
 {
     TsmBind(host);
     info->name    = "construction";
-    info->version = "0.1 (probe)";
+    info->version = "1.0";
 
     ReadSettings();
     if (!g_enabled)
@@ -1628,8 +1766,16 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     Logf("construct  game object 0x%X confirmed by the lea at 0x%X",
          P_GAMEOBJ, RVA_GAMEOBJ_LEA);
 
+    // The render hook drives BOTH halves - the probe's reports and, through
+    // Tick, WriteRanges - so it is installed whenever either of them is wanted.
+    //
+    // It used to hang off `g_probe` alone, which made `probe = 0` with
+    // `write_range = 1` a silent no-op: the hook was never installed, Tick was
+    // never called, and the plugin still logged "ready". construction.ini tells
+    // the reader to set probe = 0 once the range is known - and it is known -
+    // so that was the configuration the documentation actually recommended.
     bool armed = false;
-    if (g_probe)
+    if (g_probe || g_writeRange)
     {
         // An import swap, so it chains with depletion's and aging's hooks on
         // the same function rather than fighting them, and needs no address of
@@ -1639,8 +1785,13 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
                      (void**)&o_TerrainRender, "C3D_TERRAIN::Render"))
             armed = true;
         else
-            Logf("construct  no import slot for C3D_TERRAIN::Render - no probe");
+            Logf("construct  no import slot for C3D_TERRAIN::Render - neither the "
+                 "probe nor write_range can run");
+    }
 
+    // Positions are a probe-only concern: WriteRanges needs no geometry.
+    if (g_probe && armed)
+    {
         if (void** s = FindIatSlot(g_exe, DLL_ENGINE, SYM_NODE_GETPOS))
             o_NodeGetPosition = (t_VecGetter)*s;
         else
@@ -1672,10 +1823,18 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         return 1;
     }
 
-    if (g_writeRange && g_gameDefault > 0)
+    // Say what will actually happen, not what was asked for. Without the render
+    // hook there is nothing to run WriteRanges from, and claiming otherwise is
+    // how the gating bug above stayed invisible.
+    if (g_writeRange && !armed)
+        Logf("construct  WARN write_range is on but the render hook could not be "
+             "installed - no office range will be set. Only the window ceiling, "
+             "if it was raised, is in effect.");
+    else if (g_writeRange && g_gameDefault > 0)
         Logf("construct  ready: a construction office starting at the game's %d m will "
              "be set to %d m (its own window stops at %d, and lowering one by hand "
-             "sticks)", g_gameDefault, g_officeRange, VANILLA_RANGE_MAX);
+             "sticks)", g_gameDefault, g_officeRange, g_raiseCeiling ? g_ceiling
+                                                                    : VANILLA_RANGE_MAX);
     else if (g_writeRange)
         Logf("construct  ready: every office held at %d m - `game_default = 0`, so they "
              "cannot be lowered by hand", g_officeRange);

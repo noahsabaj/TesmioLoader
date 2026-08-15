@@ -592,8 +592,13 @@ static void ReadGameVersion(const wchar_t* exe, GameVersion* g)
     {
         if (len < 0x400 || d[0] != 'M' || d[1] != 'Z') break;
 
-        unsigned pe = Rd32(d + 0x3C);
-        if (pe + 0x108 > len) break;
+        // Every bound here is computed in size_t against `len`, never in the
+        // 32-bit type the field is stored in. `pe + 0x108` in `unsigned` wraps
+        // for a large e_lfanew, and a wrapped sum is smaller than len, so a
+        // corrupt or hostile header used to pass this test and send the memcmp
+        // below several gigabytes past the end of the buffer.
+        size_t pe = (size_t)Rd32(d + 0x3C);
+        if (pe > len || len - pe < 0x108) break;
         if (memcmp(d + pe, "PE\0\0", 4) != 0) break;
 
         unsigned short nsec  = *(unsigned short*)(d + pe + 6);
@@ -604,8 +609,8 @@ static void ReadGameVersion(const wchar_t* exe, GameVersion* g)
         if (magic != 0x20B) break;              // not PE32+, so not this game
         if (!nsec || nsec > 96) break;
 
-        unsigned secOff = pe + 24 + optsz;
-        if (secOff + (unsigned)nsec * 40 > len) break;
+        size_t secOff = pe + 24 + (size_t)optsz;
+        if (secOff > len || (len - secOff) / 40 < (size_t)nsec) break;
 
         // The format string, and the rva it lives at.
         const unsigned char* at = FindBytes(d, len, kVersionFormat, sizeof(kVersionFormat));
@@ -819,10 +824,40 @@ static PluginEntry g_plug[MAX_PLUGINS];
 static int         g_plugCount;
 static bool        g_host = true;       // [tesmioloader] plugins
 
+// Both spellings of the one path. The plugin keys go through the ANSI profile
+// API because that is what the loader uses, so both sides agree on what a key
+// looks like; game_exe goes through the wide one.
+//
+// THAT ONLY WORKS WHILE THE PATH ROUND-TRIPS THROUGH THE SYSTEM CODEPAGE. On an
+// install under, say, D:\Игры\ on a non-Cyrillic system, WideCharToMultiByte
+// substitutes '?' for what it cannot encode, and the ANSI path then names a
+// file that does not exist - so every [plugins] read silently returns its
+// default and every write silently goes nowhere. That used to happen with no
+// symptom at all beyond checkboxes that would not stick.
+//
+// It cannot be fixed here (the loader reads the same file through the same ANSI
+// API, so switching this side alone would only move the disagreement), but it
+// can be detected and said out loud.
 static void SetIniPath(const wchar_t* dllDir)
 {
     Join(g_ini, _countof(g_ini), dllDir, LOADER_INI);
-    WideCharToMultiByte(CP_ACP, 0, g_ini, -1, g_iniA, sizeof(g_iniA), NULL, NULL);
+
+    BOOL lossy = FALSE;
+    int n = WideCharToMultiByte(CP_ACP, 0, g_ini, -1, g_iniA, sizeof(g_iniA),
+                                NULL, &lossy);
+    if (n == 0)
+    {
+        g_iniA[0] = 0;
+        Msg(L"WARNING: %s cannot be expressed in the system codepage at all - "
+            L"plugin on/off settings will not be saved or read.", g_ini);
+    }
+    else if (lossy)
+    {
+        Msg(L"WARNING: %s contains characters outside the system codepage. "
+            L"tesmioloader reads this file through the ANSI profile API, so the "
+            L"plugin on/off settings will not stick. Install to a path made of "
+            L"plain ASCII.", g_ini);
+    }
 }
 
 // Loads a plugin DLL just far enough to ask it TsmPluginApiVersion(), then
@@ -932,6 +967,15 @@ static void PluginWarning(const PluginEntry* e, wchar_t* out, size_t n, bool bri
     out[0] = 0;
     if (e->apiOk) return;
 
+    // A file whose signature does not verify was deliberately not loaded, so
+    // there is no API version to report and "not a tesmioloader plugin" would
+    // be a claim nothing checked. The signature note already says everything.
+    if (e->sig == TSM_SIG_BAD)
+    {
+        wcscpy_s(out, n, brief ? L"not loaded" : L"not loaded - signature does not verify");
+        return;
+    }
+
     // One sentence for both directions. A plugin can be too old (built before
     // TSM_API_VERSION_MIN, so a field it reads has moved) or too new (built
     // against a header this loader does not have yet), and the range says which
@@ -1020,14 +1064,39 @@ static void ScanPlugins(const wchar_t* dllDir)
 
         wchar_t full[MAX_PATH];
         Join(full, _countof(full), pluginsDir, fd.cFileName);
+
+        // THE SIGNATURE IS CHECKED FIRST, and the order is the whole point.
+        //
+        // QueryPluginApiVersion below calls LoadLibraryExW, which runs the
+        // DLL's DllMain in THIS process. Doing that before deciding anything
+        // about the file made the signature mark decorative: by the time a
+        // tampered plugin was labelled SIGNATURE INVALID, its code had already
+        // executed in the launcher. Reading the bytes and verifying them
+        // touches no code at all, so it is what goes first.
+        e->sig = CheckPluginSignature(full);
+
         // The same range LoadPlugins accepts, and it must stay the same range:
         // a box the launcher ticks and the loader then refuses would be lying
         // about what ticking it does. See tesmio_api.h on TSM_API_VERSION_MIN.
-        e->apiKnown = QueryPluginApiVersion(full, &e->apiVersion);
+        //
+        // A file carrying a signature that does NOT verify is never loaded.
+        // Somebody signed those bytes and the bytes then changed, which is the
+        // one case where refusing to execute it costs nothing: the launcher
+        // still lists it, still marks it red, and the loader still makes its
+        // own decision - this only declines to run it here, to find out a
+        // version number the window would print in brackets.
+        if (e->sig == TSM_SIG_BAD)
+        {
+            e->apiKnown = false;
+            e->apiVersion = 0;
+        }
+        else
+        {
+            e->apiKnown = QueryPluginApiVersion(full, &e->apiVersion);
+        }
         e->apiOk    = e->apiKnown &&
                       e->apiVersion >= TSM_API_VERSION_MIN &&
                       e->apiVersion <= TSM_API_VERSION;
-        e->sig      = CheckPluginSignature(full);
 
         // The loader will refuse to initialise this one regardless of what the
         // ini says, so a checked box would be lying about what ticking it
@@ -1108,6 +1177,7 @@ static bool Inject(const wchar_t* gameFull, const wchar_t* dllFull)
     Msg(L"pid %lu created suspended", pi.dwProcessId);
 
     bool ok = false;
+    bool threadStarted = false;
     SIZE_T bytes = (wcslen(dllFull) + 1) * sizeof(wchar_t);
     LPVOID remote = VirtualAllocEx(pi.hProcess, NULL, bytes,
                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1131,26 +1201,60 @@ static bool Inject(const wchar_t* gameFull, const wchar_t* dllFull)
                 Fail(L"CreateRemoteThread");
             else
             {
-                WaitForSingleObject(th, 30000);
+                threadStarted = true;
 
+                // The wait result has to be checked, not just the exit code.
+                // On a timeout GetExitCodeThread hands back STILL_ACTIVE (259),
+                // which is non-zero and used to read as "the DLL loaded" - so
+                // the game was resumed and, worse, the remote path buffer was
+                // freed below while LoadLibraryW was very likely still reading
+                // it. A timeout is a failure, and the process is torn down.
+                DWORD waited = WaitForSingleObject(th, 30000);
                 DWORD loaded = 0;
-                GetExitCodeThread(th, &loaded);
-                CloseHandle(th);
 
-                if (!loaded)
+                if (waited != WAIT_OBJECT_0)
+                {
+                    Msg(L"LoadLibraryW did not finish within 30 s (%s) - "
+                        L"the game will not be started",
+                        waited == WAIT_TIMEOUT ? L"timed out" : L"wait failed");
+                }
+                else if (!GetExitCodeThread(th, &loaded))
+                {
+                    Fail(L"GetExitCodeThread");
+                }
+                else if (!loaded)
+                {
                     Msg(L"LoadLibraryW returned NULL - the DLL did not load");
+                }
                 else if (ResumeThread(pi.hThread) == (DWORD)-1)
+                {
                     Fail(L"ResumeThread");
+                }
                 else
                 {
                     Msg(L"tesmioloader.dll loaded, game resumed");
                     ok = true;
                 }
+                CloseHandle(th);
+
+                // Only safe to hand the page back once the remote thread has
+                // actually finished with it.
+                if (waited == WAIT_OBJECT_0)
+                {
+                    VirtualFreeEx(pi.hProcess, remote, 0, MEM_RELEASE);
+                    remote = NULL;
+                }
             }
         }
     }
 
-    if (remote) VirtualFreeEx(pi.hProcess, remote, 0, MEM_RELEASE);
+    // `remote` is cleared above the moment the remote thread is known to have
+    // finished with it. Anything still set here either never had a thread
+    // pointed at it, or had one that did not come back - and in the second case
+    // freeing the page under a thread that may still be reading it is exactly
+    // the bug being fixed. TerminateProcess reclaims the whole address space, so
+    // the page is only handed back when no thread was ever started.
+    if (remote && !threadStarted) VirtualFreeEx(pi.hProcess, remote, 0, MEM_RELEASE);
     if (!ok) TerminateProcess(pi.hProcess, 1);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -1505,8 +1609,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 else
                     wcscpy_s(what, _countof(what), L"a version that could not be read");
 
-                wchar_t msg[768];
-                _snwprintf_s(msg, _countof(msg), _TRUNCATE,
+                // Not `msg`: that is WndProc's own UINT parameter, and shadowing
+                // it here is a C4457 and an easy way to write the wrong one.
+                wchar_t text[768];
+                _snwprintf_s(text, _countof(text), _TRUNCATE,
                     L"This game is %s, and tesmioloader is built for %s.\n\n"
                     L"Every address it patches belongs to one of those builds. On "
                     L"any other, the hooks either refuse - leaving a loader that "
@@ -1518,7 +1624,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     L"or run the launcher with --ignore-version.",
                     what, SupportedVersionsText(), SupportedVersionsText());
 
-                MessageBoxW(hwnd, msg, L"tesmioloader - unsupported game version",
+                MessageBoxW(hwnd, text, L"tesmioloader - unsupported game version",
                             MB_ICONERROR | MB_OK);
                 SetFocus(g_path);
                 return 0;
@@ -1853,10 +1959,23 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     bool    findOnly       = false;
     bool    ignoreVersion  = false;
 
+    // wcscpy_s calls the invalid-parameter handler when the source does not
+    // fit, and the default handler TERMINATES the process - so a --game with a
+    // path longer than MAX_PATH used to kill the launcher outright instead of
+    // reporting anything. Truncation is refused explicitly and said out loud.
+    #define TSM_ARG_COPY(dst, src, what)                                        \
+        do {                                                                    \
+            if (wcslen(src) >= MAX_PATH)                                        \
+                Msg(L"%s path is longer than %d characters - ignored",          \
+                    what, MAX_PATH - 1);                                        \
+            else                                                                \
+                wcscpy_s(dst, MAX_PATH, src);                                   \
+        } while (0)
+
     for (int i = 1; argv && i < argc; i++)
     {
-        if (!_wcsicmp(argv[i], L"--game") && i + 1 < argc) wcscpy_s(game, MAX_PATH, argv[++i]);
-        else if (!_wcsicmp(argv[i], L"--dll") && i + 1 < argc) wcscpy_s(dll, MAX_PATH, argv[++i]);
+        if (!_wcsicmp(argv[i], L"--game") && i + 1 < argc) TSM_ARG_COPY(game, argv[++i], L"--game");
+        else if (!_wcsicmp(argv[i], L"--dll") && i + 1 < argc) TSM_ARG_COPY(dll, argv[++i], L"--dll");
         else if (!_wcsicmp(argv[i], L"--nogui")) gui = false;
         else if (!_wcsicmp(argv[i], L"--find")) { findOnly = true; gui = false; }
         else if (!_wcsicmp(argv[i], L"--ignore-version")) ignoreVersion = true;
@@ -1870,9 +1989,15 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
             Msg(L"  --ignore-version: inject into a game that is not %s"
                 L". It will probably not work", SupportedVersionsText());
             if (!g_console) MessageBoxW(NULL, g_log, L"tesmiolauncher", MB_OK);
+            LocalFree(argv);
             return 0;
         }
     }
+
+    #undef TSM_ARG_COPY
+
+    // Nothing below reads argv again.
+    if (argv) { LocalFree(argv); argv = NULL; }
 
     // --- the DLL. Its folder is what decides which ini both halves read.
     if (!dll[0])

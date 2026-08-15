@@ -291,12 +291,9 @@ static LONG      g_pending;          // mines needing a seed or a write
 static DWORD     g_tickThread;       // logged once, to settle which thread is which
 static DWORD     g_renderThread;
 
-static const DepletableDef* DepletableFor(int type)
-{
-    for (int i = 0; i < g_depletableCount; i++)
-        if (g_depletable[i].type == type) return &g_depletable[i];
-    return NULL;
-}
+// (DepletableFor, which returned the record rather than its index, went with
+// the last caller that wanted one - everything here keeps the index, because a
+// MineState stores that and not a pointer.)
 
 static int DepletableIndex(int type)
 {
@@ -320,6 +317,20 @@ static MineState* MineStateFor(void* b)
     }
 
     int i = freeSlot >= 0 ? freeSlot : oldest;
+
+    // Evicting a live mine is not free: its reserve0 is re-seeded from a map
+    // that has already been drawn down, so its "% left" jumps back towards 100
+    // and its quality of source with it. It takes a hash cluster of more than
+    // 16 mines to happen at all and has never been seen, but it would look like
+    // a deposit refilling itself, which is the kind of thing that gets reported
+    // as a mod bug with no way to explain it. So it says so.
+    if (freeSlot < 0 && g_mine[i].building &&
+        (g_mine[i].state == MINE_ACTIVE || g_mine[i].state == MINE_EXHAUSTED))
+        Logf("deplete  WARN evicting live mine %p from the state table (%d slots, "
+             "16-slot probe) - it will be re-seeded from the current map and its "
+             "remaining-percentage will jump. Raise MAX_MINE_STATES.",
+             g_mine[i].building, MAX_MINE_STATES);
+
     memset(&g_mine[i], 0, sizeof(g_mine[i]));
     g_mine[i].building = b;
     g_mine[i].lastSeen = g_mineTick;
@@ -430,8 +441,9 @@ static void DepleteMine(BYTE* b)
     int dep = DepletableIndex(*(int*)(typeDesc + T_DEPOSIT_TYPE));
     if (dep < 0) return;
 
+    // MineStateFor always returns a slot - it evicts the least recently seen
+    // one rather than failing - so there is nothing to test for here.
     MineState* st = MineStateFor(b);
-    if (!st) return;
 
     if (st->state == MINE_NEW)
     {

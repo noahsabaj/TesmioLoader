@@ -2,6 +2,20 @@
 
 ---
 
+*Unreleased*
+A tenth plugin, `construction`. A construction office only picks up jobs within a fixed distance of itself, so a site across town is never started however idle the office is - `office_range` in `plugins\construction.ini` makes that reach yours, 10 km by default. The range turned out to be a plain integer on the office object, the same number its own window shows as "<3,500m", so the plugin simply sets it: no patched code, and nothing for a game update to move. The office window's own + button stopped at 3500 because of a hard-coded clamp and a fixed menu of values in the button handlers, so seven instructions are patched to lift that too - all seven or none of them, verified byte for byte first. An office you have adjusted by hand is left alone; only one still sitting at the game's starting value is raised.
+Fixes found in an audit of the whole tree, none of which needed a game update to matter:
+- `construction`: `write_range` did nothing at all unless `probe` was also on, because both hung off one hook that only the probe installed - and the ini told you to turn the probe off. `game_default = 0`, documented as holding every office on every frame, quietly behaved the same as the default mode instead.
+- `tesmiolauncher`: a `LoadLibraryW` that took longer than thirty seconds was read as success, so the game was resumed and the injected DLL's path buffer was freed while the loader was probably still reading it.
+- `tesmiolauncher`: plugin DLLs were loaded - running their `DllMain` in the launcher - before their signature was checked, which made the signature mark decorative. The signature is now verified first, and a file whose signature does not verify is never loaded.
+- `tesmiolauncher`: a malformed `SOVIET64.exe` could overflow a 32-bit bounds check in the version reader and be read far past the end of the file. A `--game` path longer than 260 characters terminated the launcher outright instead of reporting anything.
+- `walking`: the eight patch sites were verified and written one at a time, so a game update that moved one of them would leave the other seven patched - the exact simulation-disagrees-with-overlay bug this plugin took four versions to fix. All eight are now verified before any is written.
+- `tesmioloader`: the save-needs-mods warning was a modal message box shown from inside the game's own file-open call, which blocked the game thread until it was dismissed. It now appears on a thread of its own.
+- `accumulator`: `building_types = 18 19` silently kept only the first type.
+- Smaller ones: an out-of-bounds read in the resource hex dump, a missing upper bound on the inline hooker's trampoline, two data races in the texture probe, a per-day log spam in `aging`, and about seventy spurious compiler warnings that were hiding the real ones.
+
+---
+
 *Update! - v. b0.3.6*
 The game's regular branch updated to v1.1.1.9 - the update notes said content only, but the executable itself had in fact reflowed throughout: `.text` grew in steps of up to nearly 500 bytes depending how far into it a given address sat, and the `.rdata` constant pool shifted in two separate clusters. Every hard-coded address across all nine active plugins has been re-derived and re-verified byte for byte against the new build; v1.1.1.7 is no longer supported, and none of its addresses remain in the source.
 The first launch on the new build crashed: `resources` was installing an import hook before its main hook, and when the main one refused (address moved), the loader freed the plugin with the import hook still pointing into it. Fixed - the import hook now installs only after the main one is confirmed.

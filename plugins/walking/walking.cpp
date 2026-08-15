@@ -59,6 +59,12 @@
 // held at max(limit, vanilla radius) - a building 900 m from a road that
 // changed has to be in the rebuild set, or it never notices the road at all.
 //
+// AND ALL EIGHT OR NONE. Verifying each site and writing it in the same breath
+// would let a game update that moved one of them recreate the 1.2 bug exactly:
+// seven sites patched, one refusing, simulation and overlay disagreeing again.
+// So TsmPluginStart checks the whole set first and only then writes any of it -
+// the same discipline plugins/construction uses for the office-range ceiling.
+//
 // Seven of the eight read .rdata and are **repointed, not overwritten**: both
 // 480.0f and 530.0f sit in the shared literal pool with dozens of unrelated
 // readers, panel widths and GUI coordinates among them, so writing over either
@@ -196,12 +202,32 @@ static bool WriteCode(void* at, const void* bytes, size_t n, const char* what)
     return true;
 }
 
-// Replaces the imm32 of a `mov dword ptr [rsp+disp8],imm32`. The four opcode
-// bytes and the value being replaced are both checked first.
-static bool PatchImmediate(DWORD siteRva, const BYTE* op, float vanilla,
-                           float value, const char* label)
+// EVERY SITE IS VERIFIED BEFORE ANY SITE IS WRITTEN.
+//
+// The check half and the write half are separate functions for one reason,
+// spelled out at the top of this file: the walking limit is written out in four
+// different functions, and the overlay runs the search AGAIN rather than reading
+// the connection vector. Patch the simulation and miss the overlay and the
+// player walks 1000 m while the button still highlights 480 - which is the bug
+// v1.2 shipped. It follows that a run where some sites verify and some do not
+// must write NOTHING, and that cannot be expressed by a loop that checks each
+// site and writes it in the same breath, which is what this used to be.
+
+// Checks the imm32 form: `mov dword ptr [rsp+disp8],imm32`.
+static bool CheckImmediate(DWORD siteRva, const BYTE* op, float vanilla,
+                           const char* label)
 {
     BYTE* site = g_exeBase + siteRva;
+
+    // Nothing else in this plugin asked before dereferencing an rva. The launcher
+    // gates the game version, so these are the right addresses for the build that
+    // got this far - but "should be readable" is not "is readable", and every
+    // other plugin in the tree checks.
+    if (!ReadablePtr(site, 8))
+    {
+        Logf("walking  %s: rva 0x%X is not readable - refusing", label, siteRva);
+        return false;
+    }
 
     if (memcmp(site, op, 4) != 0)
     {
@@ -217,7 +243,12 @@ static bool PatchImmediate(DWORD siteRva, const BYTE* op, float vanilla,
              label, siteRva, now, vanilla);
         return false;
     }
+    return true;
+}
 
+static bool WriteImmediate(DWORD siteRva, float vanilla, float value, const char* label)
+{
+    BYTE* site = g_exeBase + siteRva;
     if (!WriteCode(site + 4, &value, sizeof(value), label)) return false;
 
     Logf("walking  %-16s %.0f -> %.0f  (rva 0x%X, immediate)",
@@ -225,16 +256,20 @@ static bool PatchImmediate(DWORD siteRva, const BYTE* op, float vanilla,
     return true;
 }
 
-// Points one `movss xmm0,[rip+disp32]` at `slot` instead of the .rdata literal
-// it was reading. Refuses unless the instruction, the address it resolves to
-// and the value in there are all exactly what this build is known to have.
-//
-// `slot` already holds `value`; it is passed separately only so the log line
-// can print what the site ends up reading.
-static bool Repoint(DWORD siteRva, DWORD constRva, float vanilla,
-                    float* slot, float value, const char* label)
+// Checks one `movss xmm0,[rip+disp32]`: the instruction, the address its
+// displacement resolves to, the value sitting in there, and that the slot we
+// mean to point it at is within rel32 reach.
+static bool CheckRepoint(DWORD siteRva, DWORD constRva, float vanilla,
+                         const float* slot, const char* label)
 {
     BYTE* site = g_exeBase + siteRva;
+
+    if (!ReadablePtr(site, 8) || !ReadablePtr(g_exeBase + constRva, 4))
+    {
+        Logf("walking  %s: rva 0x%X or 0x%X is not readable - refusing",
+             label, siteRva, constRva);
+        return false;
+    }
 
     if (memcmp(site, kMovssRip, sizeof(kMovssRip)) != 0)
     {
@@ -266,9 +301,18 @@ static bool Repoint(DWORD siteRva, DWORD constRva, float vanilla,
              label, slot, site);
         return false;
     }
+    return true;
+}
+
+// Points the site at `slot`. Only ever called after CheckRepoint said yes for
+// every site in the set.
+static bool WriteRepoint(DWORD siteRva, float vanilla, float* slot, float value,
+                         const char* label)
+{
+    BYTE* site = g_exeBase + siteRva;
 
     *slot = value;
-    int disp = (int)rel;
+    int disp = (int)((BYTE*)slot - (site + 8));
     if (!WriteCode(site + 4, &disp, sizeof(disp), label)) return false;
 
     Logf("walking  %-16s %.0f -> %.0f  (rva 0x%X now reads %p)",
@@ -282,6 +326,13 @@ static bool PatchRegenOnLoad()
 {
     BYTE* cmp  = g_exeBase + RVA_REGEN_CMP;
     BYTE* test = g_exeBase + RVA_REGEN_TEST;
+
+    if (!ReadablePtr(cmp, 7) || !ReadablePtr(test, sizeof(kRegenTest)))
+    {
+        Logf("walking  regen: rva 0x%X or 0x%X is not readable - refusing",
+             RVA_REGEN_CMP, RVA_REGEN_TEST);
+        return false;
+    }
 
     if (cmp[0] != 0x83 || cmp[1] != 0x3D)
     {
@@ -371,12 +422,25 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
 {
     if (g_probe)
     {
-        Logf("walking  probe: %-16s rva 0x%X immediate %.1f", "walk build batch",
-             RVA_WALK_LIMIT, *(const float*)(g_exeBase + RVA_WALK_LIMIT + 4));
+        if (ReadablePtr(g_exeBase + RVA_WALK_LIMIT + 4, 4))
+            Logf("walking  probe: %-16s rva 0x%X immediate %.1f", "walk build batch",
+                 RVA_WALK_LIMIT, *(const float*)(g_exeBase + RVA_WALK_LIMIT + 4));
+        else
+            Logf("walking  probe: %-16s rva 0x%X unreadable", "walk build batch",
+                 RVA_WALK_LIMIT);
+
         for (int i = 0; i < (int)(sizeof(kSites) / sizeof(kSites[0])); i++)
+        {
+            if (!ReadablePtr(g_exeBase + kSites[i].constRva, 4))
+            {
+                Logf("walking  probe: %-16s rva 0x%X -> 0x%X unreadable",
+                     kSites[i].label, kSites[i].rva, kSites[i].constRva);
+                continue;
+            }
             Logf("walking  probe: %-16s rva 0x%X -> 0x%X = %.1f", kSites[i].label,
                  kSites[i].rva, kSites[i].constRva,
                  *(const float*)(g_exeBase + kSites[i].constRva));
+        }
     }
 
     // One allocation for all three repointed values: the game reads them on
@@ -396,22 +460,46 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     g_slot[SLOT_WALK_R]   = Larger(g_walk, VANILLA_WALK_R);
     g_slot[SLOT_CAR_R]    = Larger(g_car,  VANILLA_CAR_R);
 
-    // The batch builder's limit is the one immediate in the set.
-    int done = 0;
-    if (PatchImmediate(RVA_WALK_LIMIT, kWalkLimitOp, VANILLA_WALK,
-                       g_walk, "walk build batch")) done++;
+    const int siteCount = (int)(sizeof(kSites) / sizeof(kSites[0]));
 
-    for (int i = 0; i < (int)(sizeof(kSites) / sizeof(kSites[0])); i++)
+    // --- pass one: verify all eight, write none of them -------------------
+    bool allOk = CheckImmediate(RVA_WALK_LIMIT, kWalkLimitOp, VANILLA_WALK,
+                                "walk build batch");
+    for (int i = 0; i < siteCount; i++)
     {
         const Site* s = &kSites[i];
-        if (Repoint(s->rva, s->constRva, s->vanilla, &g_slot[s->slot],
-                    g_slot[s->slot], s->label) && s->slot <= SLOT_CAR)
+        if (!CheckRepoint(s->rva, s->constRva, s->vanilla, &g_slot[s->slot], s->label))
+            allOk = false;          // keep going: one run should log every failure
+    }
+
+    if (!allOk)
+    {
+        Logf("walking  one or more of the %d sites did not verify - NOTHING has been "
+             "patched. A half-patched set is worse than none: the simulation would "
+             "use one distance while the building window's overlay drew another, "
+             "which is the bug this plugin took four versions to stop shipping.",
+             siteCount + 1);
+        return 1;
+    }
+
+    // --- pass two: write them, now that every one of them checked out -----
+    int done = 0;
+    if (WriteImmediate(RVA_WALK_LIMIT, VANILLA_WALK, g_walk, "walk build batch")) done++;
+
+    for (int i = 0; i < siteCount; i++)
+    {
+        const Site* s = &kSites[i];
+        if (WriteRepoint(s->rva, s->vanilla, &g_slot[s->slot], g_slot[s->slot], s->label)
+            && s->slot <= SLOT_CAR)
             done++;
     }
 
     if (!done)
     {
-        Logf("walking  neither limit could be patched - inactive");
+        // Every site verified, so reaching here means VirtualProtect failed, and
+        // earlier sites in the loop may already be written.
+        Logf("walking  verified but could not write - the executable's pages would "
+             "not turn writable. The patch set may be incomplete; restart the game.");
         return 1;
     }
 

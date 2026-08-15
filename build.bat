@@ -122,10 +122,22 @@ rem build\tesmioloader.ini is the live config: the launcher writes the plugin
 rem checkboxes and the game path into it, so overwriting it on every build would
 rem throw away what the user chose. Copied only when it is not there yet - to
 rem pick up new defaults from the repo copy, delete it and build again.
-if not exist build\tesmioloader.ini (
-    copy /y tesmioloader.ini build\tesmioloader.ini >nul
-) else (
+rem
+rem The repo-root tesmioloader.ini is NOT in this tree - it is one of the files
+rem gitignored from the first commit and never published. That is fine: the
+rem loader falls back to a compiled-in default for every key, and the launcher
+rem creates the file itself on the first launch. What was not fine was copying
+rem it unconditionally and ignoring the result, so the build printed "The system
+rem cannot find the file specified." near the end of an otherwise clean run and
+rem the only way to know that was harmless was to have been told.
+if exist build\tesmioloader.ini (
     echo [build] build\tesmioloader.ini kept - delete it to take the repo defaults
+) else if exist tesmioloader.ini (
+    copy /y tesmioloader.ini build\tesmioloader.ini >nul
+    if errorlevel 1 ( echo [build] copying tesmioloader.ini FAILED & exit /b 1 )
+    echo [build] build\tesmioloader.ini created from the repo copy
+) else (
+    echo [build] no tesmioloader.ini to copy - the launcher writes one on first run
 )
 echo [build] ok -^> build\tesmiolauncher.exe
 endlocal

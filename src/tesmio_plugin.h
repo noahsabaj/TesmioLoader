@@ -31,6 +31,15 @@
 
 #include "tesmio_api.h"
 
+// C4505, "unreferenced function with internal linkage has been removed", is the
+// expected and correct outcome for everything below: this is a menu, and no
+// plugin orders the whole thing. Left alone it produces five to nine warnings
+// per plugin at /W4 - about seventy across the tree - which is enough noise to
+// hide a real one, and a real one did hide in it. Suppressed here and restored
+// at the bottom of the file, so a plugin's own dead code still gets reported.
+#pragma warning(push)
+#pragma warning(disable: 4505)
+
 #define DLL_ENGINE "C3DDLL64.dll"
 #define DLL_STDIO  "api-ms-win-crt-stdio-l1-1-0.dll"
 
@@ -114,6 +123,10 @@ static void Trim(char* s)
 // outside 32..126, which is what tells a real name from a stale pointer.
 static bool SafeReadStr(const void* p, char* out, size_t n)
 {
+    // Before `out[0] = 0`, not after: with n == 0 that store is already out of
+    // bounds, and `n - 1` below then underflows to SIZE_MAX and makes the copy
+    // limit the whole region.
+    if (!out || n == 0) return false;
     out[0] = 0;
     if (!p) return false;
 
@@ -151,9 +164,23 @@ static HANDLE TsmOpenLog(const char* name)
 
 static void TsmWrite(HANDLE h, const char* s, int len)
 {
-    if (h == INVALID_HANDLE_VALUE) return;
+    // NULL as well as INVALID_HANDLE_VALUE: CreateFile hands back the latter,
+    // but a handle field that was never assigned is the former, and WriteFile
+    // on it fails silently rather than loudly.
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return;
+
+    // A NEGATIVE LENGTH IS THE DANGEROUS ONE, and it is easy to produce: every
+    // caller gets `len` from _snprintf_s, which returns -1 rather than a length
+    // when _TRUNCATE truncates. (DWORD)(-1) is four gigabytes, and WriteFile
+    // would happily walk off the end of a 256-byte stack buffer trying to
+    // satisfy it. Refused here, at the one place they all go through, rather
+    // than at each call site where the next one added would miss it.
+    if (!s || len <= 0) return;
+
     DWORD wrote = 0;
     WriteFile(h, s, (DWORD)len, &wrote, NULL);
 }
+
+#pragma warning(pop)        // 4505 - see the push at the top of this file
 
 #endif // TESMIO_PLUGIN_H

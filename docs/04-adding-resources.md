@@ -290,6 +290,11 @@ zero when the engine pushes its own records and filled at runtime: the icon at
 five cargo meshes by the resource table. So a zeroed record plus those 30 bytes is
 not an approximation of a real record — it is one.
 
+> The `tools/…` scripts this page names are **not in the repository** — they are
+> gitignored and live on the author's machine. Read them as a description of the
+> technique, not a command you can run. See
+> [03-reverse-engineering.md](03-reverse-engineering.md#tools-and-ghidra-are-not-in-this-repository).
+
 That is checked rather than asserted. `tools/pe/restable.py verify` replays the
 engine's own table, rebuilds all 57 records **writing only the fields this plugin
 knows how to write**, and diffs every byte:

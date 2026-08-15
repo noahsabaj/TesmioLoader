@@ -771,7 +771,11 @@ Three lessons, in order of how much they generalise:
 
 - **An engine function named like a lock can be a GPU call.** Read the export
   before calling it from anywhere the game does not. `tools/pe/exports.py`
-  disassembles one by name in a second; it does not need Ghidra.
+  disassembles one by name in a second; it does not need Ghidra. (That script,
+  like every `tools/…` path on this page, is **not in the repository** — it is
+  gitignored and lives on the author's machine. Read it as the technique, not a
+  command you can run. See
+  [03-reverse-engineering.md](03-reverse-engineering.md#tools-and-ghidra-are-not-in-this-repository).)
 - **When copying a code path as a template, work out what makes that path
   legal**, not just what it does. Here the answer was a type number two
   comparisons away.

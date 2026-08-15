@@ -8,16 +8,37 @@ A construction office only picks up jobs near itself, so a site across town is n
 started however idle the office is and however many vehicles it has parked. The point
 of this plugin is `office_range` — make that reach yours.
 
-**The range has not been found yet, so this release cannot change it.** What is here is
-the half that finds it: `patch` is 0, both site tables are empty, and in this state the
-plugin reads construction offices and changes nothing at all. Everything under
-[Where the range lives](#where-the-range-lives) is what the probe is for, not what it
-has found.
+**The range is found and the feature works.** It is a plain `int` on the construction
+office itself, at `building+0xFC8` — the very number the office's own window prints as
+`<3,500m`. So there is no spliced code and no repointed constant in the feature at all:
+`write_range` sets the field, which is as robust as anything in this project gets,
+because there is no address for a game update to move. Confirmed in a running game: a
+site about 9 km from an office is picked up automatically and the yellow road overlay
+extends to match, and the simulation does not clamp the value back.
 
-A **count cap** — an office that stops at N jobs however close they are — is the other
-thing the limit could turn out to be. Both produce the same symptom, an idle office
-beside unstarted work, so the probe measures both and keeps them in separate tables:
-finding one must not block patching the other.
+Two smaller pieces sit either side of it:
+
+| | |
+|---|---|
+| **the window ceiling** | The `+` button stopped at 3500 because of `imm32` clamps and a fixed rung ladder baked into the button handlers — not a constant read from anywhere. `raise_ceiling` lifts the top rung so the value stays adjustable by hand. Seven sites, all verified before any is written. |
+| **the probe** | Still here, still useful, now purely diagnostic. It is what found `+0xFC8`, and it is what would find the field again after a game update moved it. |
+
+`patch` and the two site tables under [Where the range lives](#where-the-range-lives)
+are the **code-patch route**, which the field write made unnecessary. They are still
+empty and deliberately so — a table of zeroes logs "no address yet" rather than
+refusing — and they stay because a future game version could make the field read-only
+and force the question back to a code patch.
+
+> **`probe` and `write_range` are independent, but they share one hook.** Both are
+> driven by the same import swap on `C3D_TERRAIN::Render`, and that hook is installed
+> if *either* is on. It used to hang off `probe` alone, which made `probe = 0` with
+> `write_range = 1` a silent no-op — and that was the configuration this page and the
+> ini both recommended once the range was known.
+
+A **count cap** — an office that stops at N jobs however close they are — was the other
+thing the limit could have turned out to be. Both produce the same symptom, an idle
+office beside unstarted work, so the probe measures both and keeps them in separate
+tables: finding one must not block patching the other.
 
 ## What this is not
 
@@ -222,10 +243,16 @@ verdict is *"not on the `Person`"*, never *"not in the game"*.
 | Key | Default | What |
 |---|---|---|
 | `enabled` | 1 | 0 unloads the plugin without reading anything |
-| `probe` | 1 | bracket the range and hunt for it |
-| `patch` | 0 | write the patches. Needs an address in a site table |
+| **`write_range`** | **1** | **set the office's range field. This is the feature** |
 | **`office_range`** | **10000** | **metres of reach. The point of the plugin** |
+| `game_default` | 1000 | what an untouched office starts at. Only an office still carrying this is raised, which is what makes `office_range` a default rather than a cage. 0 holds *every* office on every frame and the `−` button then cannot lower one |
+| `raise_ceiling` | 1 | lift the 3500 the window's `+` button stops at |
+| `ceiling` | 10000 | what it stops at instead. Clamped to 3500…20000 — the same upper bound as `office_range`, because a value above it is one `write_range` would then refuse as implausible |
+| `probe` | 1 | bracket the range and hunt for it. Diagnostic now, not a step you have to run |
+| `patch` | 0 | the code-patch route. Needs an address in a site table, and both are empty |
 | `office_limit` | 0 | jobs one office will take on, if the gate is a count. 0 is no cap |
+| `probe_expect` | 3500 | the value to hunt for inside an office |
+| `probe_diff` | 1 | report every 4-byte slot of an office that changed since the last report |
 | `probe_from`, `probe_to` | 768, 6144 | which part of an office to compare |
 | `probe_period` | 5 | seconds between reports |
 | `probe_sites` | 8 | list members printed per office |
@@ -234,6 +261,11 @@ verdict is *"not on the `Person`"*, never *"not in the game"*.
 `office_range` is a **path length along roads**, not a straight line, and is clamped at
 20000 for the reason `walking` clamps at the same figure: these searches are
 breadth-first over the road graph, so the work grows with the square of the limit.
+
+`write_range` and `probe` share one hook and either one installs it, so turning the
+probe off does not turn the feature off. At most `MAX_OFFICES` (16) construction
+offices are tracked; a map with more says so in the log rather than ignoring the rest
+in silence.
 
 ## What a save keeps
 
@@ -326,10 +358,21 @@ comes first:
 
 ## State
 
-**Nothing has been confirmed in game.** The plugin compiles, loads, and its
-probe is armed; the histogram, the candidate scan and the cap/radius verdicts have not
-been watched against a real construction office. Every number in the log samples above
-is illustrative.
+**The feature is confirmed in game.** `building+0xFC8` was found by the probe — the
+value 3500 occurred at exactly one offset in the office object, the same offset in all
+sixteen offices on the test map, and nowhere in the type descriptor — and then
+confirmed independently by disassembly, where the office window's own clamp names that
+displacement outright while pinning it to 3500. Two unrelated methods agreeing is worth
+more than either. An office set through `write_range` really does reach that far: a site
+about 9 km out is picked up automatically and the road overlay extends to match.
+
+The seven ceiling sites are verified byte for byte against this build before any is
+written, and the `+` button reaches `ceiling` afterwards.
+
+**What is still illustrative** is everything about the *list*: the histogram, the
+candidate scan for the office's site vector, and the cap-versus-radius verdicts under
+[Bracketing the range](#bracketing-the-range). Those answer a question the field write
+made unnecessary, and the numbers in those log samples are made up.
 
 ## Where to go next
 

@@ -79,7 +79,15 @@ static LONG g_nRedirects = 0;
 
 static void WriteTo(HANDLE h, const char* s, int len)
 {
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return;
+
+    // Callers get `len` from _snprintf_s, which returns -1 on a _TRUNCATE
+    // truncation rather than a length. (DWORD)(-1) is four gigabytes, so a
+    // negative length here is a wild read off the end of a stack buffer, not a
+    // short write. Both current callers check for it themselves; this is so the
+    // next one does not have to remember.
+    if (!s || len <= 0) return;
+
     DWORD w = 0;
     WriteFile(h, s, (DWORD)len, &w, NULL);
 }
@@ -208,6 +216,11 @@ static bool PatchIat(HMODULE mod, const char* dll, const char* fn,
 
 // ---------------------------------------------------------------- inline hooking
 
+// The trampoline allocation: the stolen prologue, then a 14-byte absolute jump
+// back to target+stolen. Named rather than repeated, because the two places
+// that have to agree about it are forty lines apart and one of them is a bound.
+#define TRAMPOLINE_SIZE 64
+
 // Places a 14-byte absolute "jmp [rip+0]" over the function entry and rebuilds
 // the displaced instructions in a trampoline. Only valid because the stolen
 // prologue is position independent - it is byte-compared before we touch memory.
@@ -228,17 +241,40 @@ static bool InstallInlineHook(void* target, void* detour, void** trampolineOut,
         return false;
     }
 
+    // And the other end of the same arithmetic. The trampoline is TRAMPOLINE_SIZE
+    // bytes and holds the stolen prologue followed by its own 14-byte jump back,
+    // so anything past TRAMPOLINE_SIZE-14 writes that jump - and the absolute
+    // address after it - off the end of the allocation. The largest prologue in
+    // the tree today is 23 bytes, so there is room to spare; this is here so the
+    // day somebody hooks a function with a longer one, it refuses instead of
+    // corrupting the heap next to a code cave.
+    if (stolen > TRAMPOLINE_SIZE - 14)
+    {
+        Logf("hook FAILED  %-22s %zu bytes stolen, the trampoline holds %d - refusing to patch",
+             label, stolen, TRAMPOLINE_SIZE - 14);
+        return false;
+    }
+
     if (memcmp(target, expect, stolen) != 0)
     {
         Logf("hook FAILED  %-22s prologue mismatch - wrong game build, refusing to patch", label);
         BYTE* t = (BYTE*)target;
         char hex[128]; int o = 0;
-        for (size_t i = 0; i < stolen && o < 120; i++) o += _snprintf_s(hex + o, sizeof(hex) - o, _TRUNCATE, "%02X ", t[i]);
+        for (size_t i = 0; i < stolen && o < (int)sizeof(hex) - 4; i++)
+        {
+            // _TRUNCATE makes _snprintf_s return -1, not the length it wanted,
+            // so the running offset must never be advanced by the result blind.
+            int w = _snprintf_s(hex + o, sizeof(hex) - o, _TRUNCATE, "%02X ", t[i]);
+            if (w < 0) break;
+            o += w;
+        }
+        hex[o] = 0;
         Logf("             found: %s", hex);
         return false;
     }
 
-    BYTE* tramp = (BYTE*)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    BYTE* tramp = (BYTE*)VirtualAlloc(NULL, TRAMPOLINE_SIZE, MEM_COMMIT | MEM_RESERVE,
+                                      PAGE_EXECUTE_READWRITE);
     if (!tramp) { Logf("hook FAILED  %-22s (VirtualAlloc %lu)", label, GetLastError()); return false; }
 
     memcpy(tramp, target, stolen);
@@ -306,33 +342,9 @@ static BYTE* AllocNear(BYTE* anchor, SIZE_T size)
     return NULL;
 }
 
-// ---------------------------------------------------------------- safe pointer reads
-
-static bool SafeReadStr(const void* p, char* out, size_t n)
-{
-    out[0] = 0;
-    if (!p) return false;
-
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
-
-    const char* s = (const char*)p;
-    size_t room = (size_t)(((BYTE*)mbi.BaseAddress + mbi.RegionSize) - (BYTE*)p);
-    size_t lim  = (room < n - 1) ? room : n - 1;
-
-    size_t i = 0;
-    for (; i < lim; i++)
-    {
-        char c = s[i];
-        if (c == 0) break;
-        if ((unsigned char)c < 32 || (unsigned char)c > 126) return false;  // not a plain name
-        out[i] = c;
-    }
-    out[i] = 0;
-    return i > 0;
-}
+// (SafeReadStr used to live here. It went out with the resource-name hook that
+// moved to plugins\resources, and nothing in the host has needed it since -
+// plugins get their own copy from tesmio_plugin.h.)
 
 // ---------------------------------------------------------------- hooked engine calls
 
@@ -647,27 +659,40 @@ static DWORD h_GetTexel(void* self, int x, int y)
 {
     DWORD r = o_GetTexel(self, x, y);
 
-    int which = -1;
-    for (int i = 0; i < g_depositCount; i++)
-        if (g_depositTex[i] == self) { which = i; break; }
-    if (which < 0) return r;
-
     BYTE* ret = (BYTE*)_ReturnAddress();
     bool  fresh = true;
+    int   which = -1;
+    LONG  n     = 0;
+    char  name[64];
 
+    // One critical section for the whole read-and-record. The texture table is
+    // written under this lock by h_Load2DFromFile, on whichever thread loads the
+    // map, while this runs on the thread that samples it - so reading the count
+    // and then indexing the array outside the lock was a race that could pick up
+    // a slot mid-write. The name is copied out here too, so the log call below
+    // is not holding the lock while it does file I/O.
     EnterCriticalSection(&g_lock);
-    for (int i = 0; i < g_texelCallerCount; i++)
-        if (g_texelCallers[i] == ret) { fresh = false; break; }
-    if (fresh && g_texelCallerCount < 16) g_texelCallers[g_texelCallerCount++] = ret;
-    LONG n = ++g_texelLogged;
+    for (int i = 0; i < g_depositCount; i++)
+        if (g_depositTex[i] == self) { which = i; break; }
+
+    if (which >= 0)
+    {
+        strncpy_s(name, sizeof(name), g_depositName[which], _TRUNCATE);
+        for (int i = 0; i < g_texelCallerCount; i++)
+            if (g_texelCallers[i] == ret) { fresh = false; break; }
+        if (fresh && g_texelCallerCount < 16) g_texelCallers[g_texelCallerCount++] = ret;
+        n = ++g_texelLogged;
+    }
     LeaveCriticalSection(&g_lock);
+
+    if (which < 0) return r;
 
     // Every distinct call site, plus the first handful of samples for context.
     if (fresh || n <= 24)
     {
         size_t rva = (size_t)(ret - g_exeBase);
         Logf("texel  %s (%d,%d) -> %08lX   %sfrom SOVIET64.exe + 0x%zX",
-             g_depositName[which], x, y, r, fresh ? "NEW SITE " : "", rva);
+             name, x, y, r, fresh ? "NEW SITE " : "", rva);
     }
     return r;
 }
@@ -756,7 +781,7 @@ static const char* ExceptionName(DWORD c)
 static LONG volatile g_inCrashHandler;
 static LONG          g_crashesReported;
 
-static void ArmMapGuard();
+static void ArmMapGuards();
 
 // A guard page fires once and disarms itself, so the instruction that tripped it
 // is exactly what we want to record. Returning CONTINUE_EXECUTION re-runs it,
@@ -974,6 +999,27 @@ static void AddMapCopy(BYTE* start, SIZE_T len, int stride, const char* how)
 // Records every copy of the map it can find. The marker lives in the alpha
 // channel, so it shows up at stride 4 while the data is still interleaved as
 // loaded, and at stride 1 once the channel is pulled into a plane of its own.
+// g_mapCount and g_maps are written under g_lock by AddMapCopy, which h_fread
+// can call from whichever thread reads the file - so this probe thread has to
+// take the lock to look at them rather than racing the append.
+static int MapCount()
+{
+    EnterCriticalSection(&g_lock);
+    int n = g_mapCount;
+    LeaveCriticalSection(&g_lock);
+    return n;
+}
+
+static bool OverlapsGuarded(BYTE* base, SIZE_T size)
+{
+    bool hit = false;
+    EnterCriticalSection(&g_lock);
+    for (int i = 0; i < g_mapCount; i++)
+        if (base < g_maps[i].to && base + size > g_maps[i].from) { hit = true; break; }
+    LeaveCriticalSection(&g_lock);
+    return hit;
+}
+
 static int FindMapCopies()
 {
     SYSTEM_INFO si;
@@ -982,7 +1028,7 @@ static int FindMapCopies()
     BYTE* top = (BYTE*)si.lpMaximumApplicationAddress;
     int added = 0;
 
-    while (p < top && g_mapCount < MAX_MAP_COPIES)
+    while (p < top && MapCount() < MAX_MAP_COPIES)
     {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
@@ -993,11 +1039,8 @@ static int FindMapCopies()
                       (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY));
 
         // Never read a region we are already guarding: that trips our own trap.
-        if (usable)
-            for (int i = 0; i < g_mapCount; i++)
-                if ((BYTE*)mbi.BaseAddress < g_maps[i].to &&
-                    (BYTE*)mbi.BaseAddress + mbi.RegionSize > g_maps[i].from)
-                { usable = false; break; }
+        if (usable && OverlapsGuarded((BYTE*)mbi.BaseAddress, mbi.RegionSize))
+            usable = false;
 
         if (usable)
         {
@@ -1011,7 +1054,7 @@ static int FindMapCopies()
             {
                 BYTE* cur = q;
                 BYTE* end = q + n - 64;
-                while (cur < end && g_mapCount < MAX_MAP_COPIES)
+                while (cur < end && MapCount() < MAX_MAP_COPIES)
                 {
                     BYTE* f = (BYTE*)memchr(cur, kMapMarker[0], (size_t)(end - cur));
                     if (!f) break;
@@ -1152,6 +1195,27 @@ static bool ReadablePtr(const void* p, size_t n)
 // corrupt the process exactly as easily as the loader can. The point is that a
 // feature can be written, rebuilt and removed without touching this file, and
 // that shipping one is copying a DLL.
+//
+// PLUGINS ARE LOADED FROM INSIDE DllMain, UNDER THE LOADER LOCK.
+//
+// That is deliberate and it is not free. Init() runs on the remote thread the
+// launcher injected with, while the game's main thread is still suspended - the
+// whole reason every file the game opens passes through the gate is that not
+// one game instruction has run yet. There is no later point that keeps that
+// property, so LoadPlugins has to happen here, and each LoadLibraryExA below
+// therefore re-enters the loader lock this thread already holds.
+//
+// Recursive acquisition on one thread is fine. What is NOT fine is anything a
+// plugin's DllMain does that waits on another thread, because that thread will
+// block on the same lock and neither will move again. So the contract, which
+// tesmio_api.h states as a requirement:
+//
+//     A plugin's DllMain must do nothing but `return TRUE`.
+//
+// No CreateThread, no WaitFor*, no LoadLibrary, no synchronisation with
+// anything, no CRT work beyond what the C runtime already did. Every shipped
+// plugin obeys it - the real work is in TsmPluginInit and TsmPluginStart, which
+// run out here in ordinary code with the lock long since released.
 
 #include "tesmio_api.h"
 
@@ -1692,6 +1756,35 @@ static bool ManifestChecked(const char* saveDir)
     return seen;
 }
 
+// The warning box, on a thread of its own.
+//
+// This is reached from inside the fopen/CreateFile hooks, which means the GAME'S
+// OWN THREAD is sitting in the middle of a file open. A modal MessageBox there
+// blocks it for as long as the box is up - with the game very possibly holding
+// the D3D device and running fullscreen, which is how a warning turns into an
+// apparent hang. The box says everything it has to say without an answer, so
+// nothing waits for it: the text is copied to the heap, a thread shows it, and
+// the game carries straight on opening its file.
+static DWORD WINAPI WarnThread(LPVOID p)
+{
+    MessageBoxA(NULL, (const char*)p, "tesmioloader - save needs mods",
+                MB_ICONWARNING | MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
+    free(p);
+    return 0;
+}
+
+static void WarnAsync(const char* text)
+{
+    size_t n = strlen(text) + 1;
+    char*  copy = (char*)malloc(n);
+    if (!copy) return;
+    memcpy(copy, text, n);
+
+    HANDLE h = CreateThread(NULL, 0, WarnThread, copy, 0, NULL);
+    if (h) CloseHandle(h);
+    else   free(copy);          // no thread, no box, and nothing leaked
+}
+
 static void AppendMissing(char* missing, size_t n, const char* what,
                           const char* name, const char* why)
 {
@@ -1808,8 +1901,7 @@ static void CheckSaveManifest(const char* saveDir)
         "This save was written with tesmioloader content that is not enabled now:\r\n\r\n"
         "%s\r\nLoading it will most likely crash the game. Enable the missing items "
         "in the launcher, or load a different save.", missing);
-    MessageBoxA(NULL, text, "tesmioloader - save needs mods",
-                MB_ICONWARNING | MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
+    WarnAsync(text);
 }
 
 static void NoteSaveOpen(const char* path, bool writing)

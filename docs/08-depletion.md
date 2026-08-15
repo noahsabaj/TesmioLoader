@@ -143,6 +143,11 @@ thread.
 
 ### The row in the mine's window
 
+> The `tools/…` scripts this page names are **not in the repository** — they are
+> gitignored and live on the author's machine. Read them as a description of the
+> technique, not a command you can run. See
+> [03-reverse-engineering.md](03-reverse-engineering.md#tools-and-ghidra-are-not-in-this-repository).
+
 `FUN_140786ac0` at rva `0x786AC0` builds the panel that shows **Quality of
 source** and **Current production per workday**. Found by scanning `.text` for
 reads of `building+0xDF8` and matching the label ids it hands to

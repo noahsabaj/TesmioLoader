@@ -8,6 +8,29 @@ Everything described here lives in `tesmioloader/tools/`, and the Ghidra project
 in `tesmioloader/ghidra/proj`. Both used to sit in a session scratchpad under
 `%TEMP%`, which is not a place to keep a 295 MB analysis database.
 
+## `tools/` and `ghidra/` are not in this repository
+
+Both are in `.gitignore` and have been since the first commit, so **every
+`tools/…` path in this file and in the rest of `docs/` names a script you will
+not find in your checkout.** They are on the author's machine only.
+
+This is deliberate rather than an oversight, and nothing is lost by it:
+
+- The **Ghidra project** is a derived artifact. It regenerates from your own
+  copy of `SOVIET64.exe` in a few minutes of analysis — see
+  [Ghidra](#4-ghidra--when-the-others-run-out) below.
+- The **Python helpers** (`tools/pe/*.py`, `tools/assets/*.py`) are small
+  single-purpose scripts, and this page spells out what each one does and the
+  arguments it takes. Rewriting the one you need is an afternoon at most, and
+  most of them are thirty lines around `pefile` or `struct`.
+- `tools/signing/` holds the private half of the release key. That one is not
+  obtainable and is not meant to be — a third-party build is *correctly*
+  unsigned, and the launcher says nothing about it rather than accusing it of
+  anything. See [09-plugins.md](09-plugins.md).
+
+So read a `tools/…` path here as *"the technique, and what a script for it
+would take as arguments"*, not as a command you can run.
+
 ## 1. PE structure — free, instant, no game running
 
 Import tables, export tables, sections, the exception directory. Answers

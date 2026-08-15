@@ -249,6 +249,11 @@ placeholders are `buildings/blankspecular.dds` and `buildings/blankbump.dds`.
 
 Three things to know before writing one:
 
+> The `tools/…` scripts this page names are **not in the repository** — they are
+> gitignored and live on the author's machine. Read them as a description of the
+> technique, not a command you can run. See
+> [03-reverse-engineering.md](03-reverse-engineering.md#tools-and-ghidra-are-not-in-this-repository).
+
 **Submaterial names come out of the mesh, not out of imagination.** They are in
 the `.nmf` header, `0x40` bytes each starting at `+0x14`, and
 `tools/assets/nmf.py` prints them:

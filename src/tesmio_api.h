@@ -276,6 +276,23 @@ typedef struct TsmPluginInfo
     const char* version;
 } TsmPluginInfo;
 
+// A PLUGIN'S DllMain MUST DO NOTHING BUT `return TRUE`.
+//
+// This is a hard requirement, not a style note. The host loads every plugin
+// from inside its own DllMain, on the injected thread, while the game's main
+// thread is still suspended - that is what guarantees no game code has run
+// before the hooks are in. So each plugin's DllMain executes UNDER THE WINDOWS
+// LOADER LOCK. Recursive acquisition on the one thread is fine; anything that
+// waits on a *different* thread is a deadlock with no diagnostic:
+//
+//     no CreateThread, no WaitForSingleObject or any other wait,
+//     no LoadLibrary, no GetModuleHandle on a module that may not be in yet,
+//     no synchronisation with anything, no file or registry work.
+//
+// Everything real belongs in TsmPluginInit and TsmPluginStart, both of which
+// run in ordinary code with the lock released. There is nothing DllMain can do
+// that Init cannot do more safely a moment later.
+//
 // ApiVersion and Init are required. ApiVersion is called first and must do
 // nothing else: it is what decides whether Init may be called at all.
 //

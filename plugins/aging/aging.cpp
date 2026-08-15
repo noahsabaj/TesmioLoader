@@ -114,6 +114,7 @@ struct Tracked
 static Tracked  g_track[MAX_PEOPLE];
 static int      g_tracked;
 static int      g_lastDay = -1;
+static int      g_lastArm = -1;     // the day Arm last ran, so it runs at most daily
 static int      g_reports;
 static bool     g_armed;
 
@@ -192,15 +193,27 @@ static void Report(int day, int year)
 {
     Logf("aging    ---- day %d of year %d ----", day, year);
 
+    // Compacted rather than nulled in place. A dropped citizen used to leave a
+    // NULL in the array with g_tracked unchanged, so ReadablePtr(NULL) failed
+    // again on the next report and the same "is gone" line was printed every
+    // in-game day for the rest of the run.
+    int live = 0;
     for (int i = 0; i < g_tracked; i++)
     {
         BYTE* p = g_track[i].person;
-        if (!ReadablePtr(p, PERSON_SIZE))
+        if (!p || !ReadablePtr(p, PERSON_SIZE))
         {
             Logf("aging    person %d (%p) is gone - dropped", i, p);
-            g_track[i].person = NULL;
             continue;
         }
+        if (live != i) g_track[live] = g_track[i];
+        live++;
+    }
+    g_tracked = live;
+
+    for (int i = 0; i < g_tracked; i++)
+    {
+        BYTE* p = g_track[i].person;
 
         int printed = 0;
         for (int off = g_from; off + 4 <= g_to; off += 4)
@@ -257,13 +270,23 @@ static void Tick(void)
     int    count = People(&begin);
     if (count <= 0) return;
 
-    if (!g_armed)
+    // Re-armed whenever the tracked set has emptied out, not only once per
+    // session. Loading a save frees every Person in the world, so all of them
+    // are dropped at the next report - and with a one-shot Arm the probe then
+    // followed nobody, reported nothing, and never said why.
+    // At most once per calendar day, or a map with no readable Person at all
+    // would re-arm and log on every single frame.
+    if ((!g_armed || g_tracked == 0) && day != g_lastArm)
     {
+        if (g_armed) Logf("aging    every tracked citizen is gone - re-arming "
+                          "(a save was probably loaded)");
         Arm(begin, count);
         g_armed   = true;
+        g_lastArm = day;
         g_lastDay = day;
         return;
     }
+    if (g_tracked == 0) return;
 
     if (day == g_lastDay) return;
     g_lastDay = day;

@@ -86,6 +86,11 @@ does, in `RebaseResourceCache`.
 
 ### Record layout
 
+> The `tools/…` scripts this page names are **not in the repository** — they are
+> gitignored and live on the author's machine. Read them as a description of the
+> technique, not a command you can run. See
+> [03-reverse-engineering.md](03-reverse-engineering.md#tools-and-ghidra-are-not-in-this-repository).
+
 **Complete, and none of it guessed.** The resource table below builds each record
 in one stack buffer whose `rbp` is `record + 0xC0`, so replaying every write
 through `rbp` gives the exact contents of all 57 base-game records with the game

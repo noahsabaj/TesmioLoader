@@ -38,7 +38,15 @@ started with:
 | `cities` | a per-city radius and shape | [14](14-cities.md) |
 | `daynight` | one sunrise and one sunset per calendar day | [15](15-daynight.md) |
 | `easystart` | needs that arrive with the century | [16](16-easystart.md) |
-| `construction` | a construction office's assignment cap | [17](17-construction.md) |
+| `construction` | how far a construction office reaches for work | [17](17-construction.md) |
+| `aging` | **parked.** A probe for the citizen age field | [18](18-aging.md) |
+
+Two folders under `plugins/` are **parked**, and `build.bat` skips both by name so
+neither ships a DLL: `aging`, which is a probe with no feature behind it yet, and
+`buildings`, which writes into the game's own `workshop_wip` folder and wants a
+deliberate look after a game update before it runs again. Nothing about either is
+deleted — the source, the `.ini` and the doc page all stay, and deleting the skip
+block in `build.bat` is the whole of turning one back on.
 
 The split is not about safety. A plugin is in the same address space and can
 corrupt the process exactly as easily as the loader can — there is no sandbox
@@ -352,7 +360,11 @@ Tesmio".
 
 The private key is `tools/signing/tsm_private.bin`, a 104-byte CNG blob made
 once by `build\tsmsign.exe genkey`. **It is the one file a release must never
-ship** — whoever has it can sign as Tesmio, and there is no revocation. Keep a
+ship** — whoever has it can sign as Tesmio, and there is no revocation. It is
+therefore not in this repository, and neither are `tools/signing/tsmsign.cpp`,
+`src/tesmio_sign.h` or `src/tesmio_pubkey.h`: a checkout without them builds a
+launcher that never mentions signatures at all, which is why an unsigned
+third-party build is marked with nothing rather than accused of anything. Keep a
 backup somewhere outside the tree; losing it means generating a new pair,
 regenerating `tesmio_pubkey.h` (`tsmsign pubkey`), and every old signature
 becoming invalid. The public header is safe to commit — it is public in the
