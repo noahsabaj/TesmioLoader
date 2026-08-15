@@ -64,6 +64,9 @@
 // seven sites patched, one refusing, simulation and overlay disagreeing again.
 // So TsmPluginStart checks the whole set first and only then writes any of it -
 // the same discipline plugins/construction uses for the office-range ceiling.
+// The writing half is held to it too: a write is a page turned writable and then
+// four bytes copied, and only the first half can fail, so every page in the set
+// is turned writable before the first byte of any of them lands.
 //
 // Seven of the eight read .rdata and are **repointed, not overwritten**: both
 // 480.0f and 530.0f sit in the shared literal pool with dozens of unrelated
@@ -154,6 +157,11 @@ static const Site kSites[] = {
     { 0x12F4F2, RVA_CAR_RADIUS,  VANILLA_CAR_R,  SLOT_CAR_R,  "car rebuild"       },
 };
 
+// Plus the batch builder's immediate, which is the site the set is always one
+// larger than kSites for.
+static const int kSiteCount = (int)(sizeof(kSites) / sizeof(kSites[0]));
+static const int kWriteCount = kSiteCount + 1;
+
 // The save loader's "this save predates the longer distances" test. v1.1.1.9;
 // was 0x438366/0x438373 - same shape, cmp+jge then a separate test al,al/jne,
 // both landing on the same target, confirmed by disassembly.
@@ -188,18 +196,43 @@ static float Larger(float a, float b) { return a > b ? a : b; }
 
 // ---------------------------------------------------------------- patching
 
-static bool WriteCode(void* at, const void* bytes, size_t n, const char* what)
+// A patch that has been worked out but not yet made: where it goes, the bytes,
+// and the protection its page carried before we asked for it. Nothing here is
+// wider than a rel32 or an imm32.
+struct Staged
+{
+    BYTE*       at;
+    BYTE        bytes[4];
+    size_t      n;
+    DWORD       prot;
+    const char* what;
+};
+
+// The half of a write that can fail. Do it for the whole set, then copy.
+static bool Unprotect(Staged* w)
+{
+    if (VirtualProtect(w->at, w->n, PAGE_EXECUTE_READWRITE, &w->prot)) return true;
+    Logf("walking  %s: the page holding %p would not turn writable - refusing",
+         w->what, w->at);
+    return false;
+}
+
+static void Apply(Staged* w) { memcpy(w->at, w->bytes, w->n); }
+
+// Sites share pages - two of the walking sites live in the same 4K - so a set is
+// always put back youngest first. In that order the *first* Unprotect of a page,
+// the only one that saw the real protection, is also the last to hand it back;
+// oldest first would leave the page permanently writable instead.
+static void Restore(Staged* w)
 {
     DWORD prot = 0;
-    if (!VirtualProtect(at, n, PAGE_EXECUTE_READWRITE, &prot))
-    {
-        Logf("walking  VirtualProtect failed at %p (%s)", at, what);
-        return false;
-    }
-    memcpy(at, bytes, n);
-    VirtualProtect(at, n, prot, &prot);
-    FlushInstructionCache(GetCurrentProcess(), at, n);
-    return true;
+    VirtualProtect(w->at, w->n, w->prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), w->at, w->n);
+}
+
+static void RestoreAll(Staged* w, int n)
+{
+    for (int i = n - 1; i >= 0; i--) Restore(&w[i]);
 }
 
 // EVERY SITE IS VERIFIED BEFORE ANY SITE IS WRITTEN.
@@ -246,14 +279,12 @@ static bool CheckImmediate(DWORD siteRva, const BYTE* op, float vanilla,
     return true;
 }
 
-static bool WriteImmediate(DWORD siteRva, float vanilla, float value, const char* label)
+static void StageImmediate(DWORD siteRva, float value, const char* label, Staged* w)
 {
-    BYTE* site = g_exeBase + siteRva;
-    if (!WriteCode(site + 4, &value, sizeof(value), label)) return false;
-
-    Logf("walking  %-16s %.0f -> %.0f  (rva 0x%X, immediate)",
-         label, vanilla, value, siteRva);
-    return true;
+    w->at   = g_exeBase + siteRva + 4;
+    w->n    = sizeof(value);
+    w->what = label;
+    memcpy(w->bytes, &value, sizeof(value));
 }
 
 // Checks one `movss xmm0,[rip+disp32]`: the instruction, the address its
@@ -304,20 +335,18 @@ static bool CheckRepoint(DWORD siteRva, DWORD constRva, float vanilla,
     return true;
 }
 
-// Points the site at `slot`. Only ever called after CheckRepoint said yes for
-// every site in the set.
-static bool WriteRepoint(DWORD siteRva, float vanilla, float* slot, float value,
-                         const char* label)
+// Points the site at `slot`. The value is already in there and was already in
+// there when CheckRepoint measured this same pointer for rel32 reach - the slots
+// are filled once, before anything is verified, and nothing writes them again.
+static void StageRepoint(DWORD siteRva, const float* slot, const char* label, Staged* w)
 {
     BYTE* site = g_exeBase + siteRva;
+    int   disp = (int)((const BYTE*)slot - (site + 8));
 
-    *slot = value;
-    int disp = (int)((BYTE*)slot - (site + 8));
-    if (!WriteCode(site + 4, &disp, sizeof(disp), label)) return false;
-
-    Logf("walking  %-16s %.0f -> %.0f  (rva 0x%X now reads %p)",
-         label, vanilla, value, siteRva, slot);
-    return true;
+    w->at   = site + 4;
+    w->n    = sizeof(disp);
+    w->what = label;
+    memcpy(w->bytes, &disp, sizeof(disp));
 }
 
 // Makes the save loader's own "regenerate walking and parking connections" pass
@@ -355,14 +384,29 @@ static bool PatchRegenOnLoad()
         return false;
     }
 
+    // Both bytes or neither. Bumping the version compare while the terrain guard
+    // still stands is the worst of the three outcomes: the loader would skip the
+    // regeneration on two DLC maps and take it everywhere else, and the log would
+    // say the same thing either way.
+    //
     // 127 is the largest an imm8 compare can carry, and the format version is
     // 124 today. If a future patch takes it past 127 this stops working - and
     // it stops by doing nothing, which is the right way round.
-    BYTE ver = 127;
-    if (!WriteCode(cmp + 6, &ver, 1, "save-version compare")) return false;
-    if (!WriteCode(test, kXorAl, sizeof(kXorAl), "terrain-name guard")) return false;
+    Staged w[2];
+    w[0].at = cmp + 6; w[0].n = 1;                w[0].what = "save-version compare";
+    w[1].at = test;    w[1].n = sizeof(kXorAl);   w[1].what = "terrain-name guard";
+    w[0].bytes[0] = 127;
+    memcpy(w[1].bytes, kXorAl, sizeof(kXorAl));
 
-    Logf("walking  regen on: every load rebuilds all walking and parking connections");
+    if (!Unprotect(&w[0])) return false;
+    if (!Unprotect(&w[1])) { RestoreAll(w, 1); return false; }
+
+    Apply(&w[0]);
+    Apply(&w[1]);
+    RestoreAll(w, 2);
+
+    Logf("walking  regen on: save-version compare now 127, terrain guard now xor al,al"
+         " - every load rebuilds all walking and parking connections");
     return true;
 }
 
@@ -429,7 +473,7 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
             Logf("walking  probe: %-16s rva 0x%X unreadable", "walk build batch",
                  RVA_WALK_LIMIT);
 
-        for (int i = 0; i < (int)(sizeof(kSites) / sizeof(kSites[0])); i++)
+        for (int i = 0; i < kSiteCount; i++)
         {
             if (!ReadablePtr(g_exeBase + kSites[i].constRva, 4))
             {
@@ -460,12 +504,10 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     g_slot[SLOT_WALK_R]   = Larger(g_walk, VANILLA_WALK_R);
     g_slot[SLOT_CAR_R]    = Larger(g_car,  VANILLA_CAR_R);
 
-    const int siteCount = (int)(sizeof(kSites) / sizeof(kSites[0]));
-
     // --- pass one: verify all eight, write none of them -------------------
     bool allOk = CheckImmediate(RVA_WALK_LIMIT, kWalkLimitOp, VANILLA_WALK,
                                 "walk build batch");
-    for (int i = 0; i < siteCount; i++)
+    for (int i = 0; i < kSiteCount; i++)
     {
         const Site* s = &kSites[i];
         if (!CheckRepoint(s->rva, s->constRva, s->vanilla, &g_slot[s->slot], s->label))
@@ -478,29 +520,45 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
              "patched. A half-patched set is worse than none: the simulation would "
              "use one distance while the building window's overlay drew another, "
              "which is the bug this plugin took four versions to stop shipping.",
-             siteCount + 1);
+             kWriteCount);
         return 1;
     }
 
-    // --- pass two: write them, now that every one of them checked out -----
-    int done = 0;
-    if (WriteImmediate(RVA_WALK_LIMIT, VANILLA_WALK, g_walk, "walk build batch")) done++;
+    // --- pass two: work out every write, take every page, then copy -------
+    // Same shape as pass one and for the same reason. A rebuild radius is no more
+    // optional than a limit: a radius narrower than the distance it serves leaves
+    // buildings out of the set the builders are handed, so a set that lost only
+    // the radii would still be a set that walks 1000 m and rebuilds 530.
+    Staged writes[kWriteCount];
+    StageImmediate(RVA_WALK_LIMIT, g_walk, "walk build batch", &writes[0]);
+    for (int i = 0; i < kSiteCount; i++)
+        StageRepoint(kSites[i].rva, &g_slot[kSites[i].slot], kSites[i].label,
+                     &writes[i + 1]);
 
-    for (int i = 0; i < siteCount; i++)
+    int taken = 0;
+    while (taken < kWriteCount && Unprotect(&writes[taken])) taken++;
+
+    if (taken != kWriteCount)
+    {
+        // Unprotect named the site. Nothing has been copied yet, so giving the
+        // pages back leaves the executable exactly as it was found.
+        RestoreAll(writes, taken);
+        Logf("walking  %s would not take a write - NOTHING has been patched, and "
+             "the other %d sites were left alone rather than shipping the split "
+             "the whole check exists to prevent.", writes[taken].what, kWriteCount - 1);
+        return 1;
+    }
+
+    for (int i = 0; i < kWriteCount; i++) Apply(&writes[i]);
+    RestoreAll(writes, kWriteCount);
+
+    Logf("walking  %-16s %.0f -> %.0f  (rva 0x%X, immediate)", "walk build batch",
+         VANILLA_WALK, g_walk, RVA_WALK_LIMIT);
+    for (int i = 0; i < kSiteCount; i++)
     {
         const Site* s = &kSites[i];
-        if (WriteRepoint(s->rva, s->vanilla, &g_slot[s->slot], g_slot[s->slot], s->label)
-            && s->slot <= SLOT_CAR)
-            done++;
-    }
-
-    if (!done)
-    {
-        // Every site verified, so reaching here means VirtualProtect failed, and
-        // earlier sites in the loop may already be written.
-        Logf("walking  verified but could not write - the executable's pages would "
-             "not turn writable. The patch set may be incomplete; restart the game.");
-        return 1;
+        Logf("walking  %-16s %.0f -> %.0f  (rva 0x%X now reads %p)", s->label,
+             s->vanilla, g_slot[s->slot], s->rva, &g_slot[s->slot]);
     }
 
     if (g_regen && !PatchRegenOnLoad())

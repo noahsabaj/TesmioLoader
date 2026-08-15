@@ -190,7 +190,7 @@ walking  car build        2500 -> 2500  (rva 0x12F926 now reads 00007FF7CA920004
 walking  car overlay      2500 -> 2500  (rva 0x43FFB3 now reads 00007FF7CA920004)
 walking  walk rebuild     530 -> 1000  (rva 0x12DEA7 now reads 00007FF7CA920008)
 walking  car rebuild      2600 -> 2600  (rva 0x12F502 now reads 00007FF7CA92000C)
-walking  regen on: every load rebuilds all walking and parking connections
+walking  regen on: save-version compare now 127, terrain guard now xor al,al - every load rebuilds all walking and parking connections
 ```
 
 Three sites reading the same address is the point, not a bug: `SLOT_WALK` is one
@@ -205,12 +205,29 @@ game.info  Loading string --- Import - Regenerating walking and parking connecti
 A refusal names the site and what was found there instead:
 
 ```
-walking  walking: rva 0x12E2DD holds 300.0, expected 480.0 - refusing
+walking  walk build batch: rva 0x12E2DD holds 300.0, expected 480.0 - refusing
+walking  one or more of the 8 sites did not verify - NOTHING has been patched.
 ```
 
-If every *limit* refuses, the plugin returns non-zero from `Start` and is
-inactive. A rebuild radius that refuses only costs the radius. Nothing is
-hooked, so a refusing plugin stays loaded and does nothing.
+**One site refusing costs all eight.** The set is verified in full before a byte
+of it is written, and a single site that does not look the way it should stops
+the whole patch — so a refusal costs the base game's distances, everywhere,
+which is exactly what the plugin is for. The alternative is what 1.2 shipped: a
+partial set where the simulation and the overlay disagree, and the log looks
+clean. That includes the two rebuild radii; a radius left at 530 while the limit
+went to 1000 leaves buildings out of the set handed to the builders, which is the
+same split wearing a different hat.
+
+The verify pass keeps going after the first refusal, so one run logs every site
+that is wrong rather than the first. The writes are held to the same rule: every
+page in the set is turned writable first, and if one will not, the pages taken
+so far are handed back untouched.
+
+`regen_on_load` is its own all-or-none pair — the version compare and the
+terrain guard are both written or neither is, since bumping the compare alone
+would regenerate on every map except two and say nothing about it.
+
+Nothing is hooked, so a refusing plugin stays loaded and does nothing.
 
 ## State
 
