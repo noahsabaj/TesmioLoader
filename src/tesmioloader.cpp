@@ -941,9 +941,18 @@ static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static int MapCount();
+
 static void ArmMapGuards()
 {
-    for (int i = 0; i < g_mapCount; i++)
+    // A snapshot of the count is enough to walk safely: AddMapCopy fills an
+    // entry completely before it bumps the count, so everything below n is
+    // finished and never rewritten - and `armed` is the one field that moves
+    // afterwards, which is why it moves through Interlocked. Holding the lock
+    // across the VirtualProtect calls would put the game's own thread behind
+    // us for no gain.
+    int n = MapCount();
+    for (int i = 0; i < n; i++)
     {
         MapCopy& m = g_maps[i];
         if (m.to <= m.from) continue;
@@ -955,6 +964,7 @@ static void ArmMapGuards()
     }
 }
 
+// Both of these run with g_lock held.
 static bool AlreadyKnown(BYTE* start)
 {
     for (int i = 0; i < g_mapCount; i++)
@@ -964,10 +974,13 @@ static bool AlreadyKnown(BYTE* start)
 
 static void AddMapCopy(BYTE* start, SIZE_T len, int stride, const char* how)
 {
-    if (!g_probeMap || g_mapCount >= MAX_MAP_COPIES) return;
+    if (!g_probeMap) return;
 
     EnterCriticalSection(&g_lock);
-    if (!AlreadyKnown(start))
+    // The room test belongs inside the lock, not outside it: the probe thread
+    // and whichever thread h_fread is on can both find the marker, both see a
+    // free slot, and the second one to arrive would write g_maps[MAX_MAP_COPIES].
+    if (g_mapCount < MAX_MAP_COPIES && !AlreadyKnown(start))
     {
         const uintptr_t PG = 0xFFF;
         MapCopy& m = g_maps[g_mapCount];
@@ -996,9 +1009,6 @@ static void AddMapCopy(BYTE* start, SIZE_T len, int stride, const char* how)
     LeaveCriticalSection(&g_lock);
 }
 
-// Records every copy of the map it can find. The marker lives in the alpha
-// channel, so it shows up at stride 4 while the data is still interleaved as
-// loaded, and at stride 1 once the channel is pulled into a plane of its own.
 // g_mapCount and g_maps are written under g_lock by AddMapCopy, which h_fread
 // can call from whichever thread reads the file - so this probe thread has to
 // take the lock to look at them rather than racing the append.
@@ -1010,16 +1020,38 @@ static int MapCount()
     return n;
 }
 
-static bool OverlapsGuarded(BYTE* base, SIZE_T size)
+struct GuardedRange { BYTE* from; BYTE* to; };
+
+// The guarded ranges as they stand at this instant, copied out so the scan can
+// consult them without the lock. It cannot hold the lock while it reads
+// gigabytes, and a bool answered under the lock and acted on after it is a
+// lie by the time it is used - so take the ranges themselves and work from
+// those. A copy appended after the snapshot is not in it, and that stays
+// survivable: OnGuardPage recognises a read coming from this module, disarms
+// and continues.
+static int SnapshotGuarded(GuardedRange* out, int max)
 {
-    bool hit = false;
     EnterCriticalSection(&g_lock);
-    for (int i = 0; i < g_mapCount; i++)
-        if (base < g_maps[i].to && base + size > g_maps[i].from) { hit = true; break; }
+    int n = g_mapCount < max ? g_mapCount : max;
+    for (int i = 0; i < n; i++)
+    {
+        out[i].from = g_maps[i].from;
+        out[i].to   = g_maps[i].to;
+    }
     LeaveCriticalSection(&g_lock);
-    return hit;
+    return n;
 }
 
+static bool OverlapsGuarded(const GuardedRange* g, int n, BYTE* base, SIZE_T size)
+{
+    for (int i = 0; i < n; i++)
+        if (base < g[i].to && base + size > g[i].from) return true;
+    return false;
+}
+
+// Records every copy of the map it can find. The marker lives in the alpha
+// channel, so it shows up at stride 4 while the data is still interleaved as
+// loaded, and at stride 1 once the channel is pulled into a plane of its own.
 static int FindMapCopies()
 {
     SYSTEM_INFO si;
@@ -1028,10 +1060,16 @@ static int FindMapCopies()
     BYTE* top = (BYTE*)si.lpMaximumApplicationAddress;
     int added = 0;
 
+    GuardedRange guarded[MAX_MAP_COPIES];
+
     while (p < top && MapCount() < MAX_MAP_COPIES)
     {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
+
+        // Refreshed per region rather than once at the top: the scan itself
+        // adds copies, and the next region has to know about them.
+        int nGuarded = SnapshotGuarded(guarded, MAX_MAP_COPIES);
 
         bool usable = mbi.State == MEM_COMMIT &&
                       mbi.RegionSize >= 0x100000 &&
@@ -1039,7 +1077,8 @@ static int FindMapCopies()
                       (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY));
 
         // Never read a region we are already guarding: that trips our own trap.
-        if (usable && OverlapsGuarded((BYTE*)mbi.BaseAddress, mbi.RegionSize))
+        if (usable && OverlapsGuarded(guarded, nGuarded,
+                                      (BYTE*)mbi.BaseAddress, mbi.RegionSize))
             usable = false;
 
         if (usable)
@@ -1107,7 +1146,7 @@ static DWORD WINAPI ProbeThread(LPVOID)
         ArmMapGuards();
         Sleep(round < 30 ? 50 : 400);
     }
-    Logf("probe  finished: %d copies watched, %d distinct readers", g_mapCount, g_probeSeenCount);
+    Logf("probe  finished: %d copies watched, %d distinct readers", MapCount(), g_probeSeenCount);
     return 0;
 }
 
@@ -1213,9 +1252,14 @@ static bool ReadablePtr(const void* p, size_t n)
 //     A plugin's DllMain must do nothing but `return TRUE`.
 //
 // No CreateThread, no WaitFor*, no LoadLibrary, no synchronisation with
-// anything, no CRT work beyond what the C runtime already did. Every shipped
-// plugin obeys it - the real work is in TsmPluginInit and TsmPluginStart, which
-// run out here in ordinary code with the lock long since released.
+// anything, no CRT work beyond what the C runtime already did. The real work is
+// in TsmPluginInit and TsmPluginStart, which run out here in ordinary code with
+// the lock long since released.
+//
+// Every shipped plugin's DllMain returns TRUE and nothing else, bar one:
+// resources closes its open handle on DLL_PROCESS_DETACH. That is a CloseHandle
+// on a file this process owns - it waits on no thread, so it cannot deadlock
+// the load - and detach is past the point where anything else could close it.
 
 #include "tesmio_api.h"
 
@@ -1739,19 +1783,35 @@ static void WriteSaveManifest(const char* saveDir)
 
 // One check per save per session: the game reads stats.ini when a save is
 // browsed as well as when it is loaded, and the warning must not repeat.
-#define MAX_MANIFEST_CHECKED 16
+//
+// 64 rather than 16 because the load screen walks every save the player has,
+// and sixteen is a number a real save folder passes. Past the end the table
+// stopped recording, so each of the remaining saves was "unseen" on every
+// single read of its stats.ini - one box per scroll of the list, stacking.
+#define MAX_MANIFEST_CHECKED 64
 static char g_manifestChecked[MAX_MANIFEST_CHECKED][MAX_PATH * 2];
 static int  g_manifestCheckedCount;
+static bool g_manifestOverflowed;      // both live under g_lock
 
+// True when this save has already been warned about. The interesting case is
+// the full table: we cannot remember the save, so we cannot honestly say it was
+// warned about - but a box we will never remember raising is a box that comes
+// back every read. So the overflow gets exactly one warning for the whole
+// session and every unrecorded save after it answers "seen".
 static bool ManifestChecked(const char* saveDir)
 {
     EnterCriticalSection(&g_lock);
     bool seen = false;
     for (int i = 0; i < g_manifestCheckedCount; i++)
         if (_stricmp(g_manifestChecked[i], saveDir) == 0) { seen = true; break; }
-    if (!seen && g_manifestCheckedCount < MAX_MANIFEST_CHECKED)
-        strncpy_s(g_manifestChecked[g_manifestCheckedCount++],
-                  sizeof(g_manifestChecked[0]), saveDir, _TRUNCATE);
+    if (!seen)
+    {
+        if (g_manifestCheckedCount < MAX_MANIFEST_CHECKED)
+            strncpy_s(g_manifestChecked[g_manifestCheckedCount++],
+                      sizeof(g_manifestChecked[0]), saveDir, _TRUNCATE);
+        else if (g_manifestOverflowed) seen = true;
+        else                           g_manifestOverflowed = true;
+    }
     LeaveCriticalSection(&g_lock);
     return seen;
 }
