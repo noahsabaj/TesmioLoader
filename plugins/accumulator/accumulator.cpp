@@ -235,7 +235,12 @@ static int   g_enabled     = 1;
 static float g_chargeRate  = 60.0f;   // units per second into the battery
 static float g_dischargeRate = 120.0f;// units per second back out of it
 static float g_minCapacity = 500.0f;  // what tells a battery from a transformer
-static int   g_types[8];              // building types that may be a battery
+// Building types that may be a battery. 32 rather than 8 because the only real
+// bound is the 128-char buffer the ini value is read into, which cannot hold
+// more than 64 one-digit types - and a list that long is a typo either way, so
+// the parser says which entries it dropped rather than stopping at eight in
+// silence.
+static int   g_types[32];
 static int   g_typeCount   = 0;
 static float g_logSeconds  = 0.0f;
 static int   g_probe       = 0;
@@ -1000,15 +1005,61 @@ static void h_Dispatch(void* game)
 // comma and tab, while the advance loop only stopped at a comma - so a
 // space-separated list ran to the end of the string after the first value and
 // every type but the first was silently dropped.
+//
+// Every way a line can be wrong now says so. atoi("nineteen") is 0, which is a
+// real building type and also suppresses the transformator default below, so a
+// misspelled word used to leave the plugin hunting for type 0 with no hint of
+// why; a list longer than the array simply stopped; and a repeated number cost
+// a slot and a comparison per building for nothing. A typo in an ini is worth a
+// line in the log - the alternative is a plugin that quietly does the wrong
+// thing.
 static void ParseTypes(const char* s)
 {
+    const int cap = (int)(sizeof(g_types) / sizeof(g_types[0]));
     g_typeCount = 0;
-    while (*s && g_typeCount < (int)(sizeof(g_types) / sizeof(g_types[0])))
+    while (*s)
     {
         while (*s == ' ' || *s == ',' || *s == '\t') s++;
         if (!*s) break;
-        g_types[g_typeCount++] = atoi(s);
+
+        const char* tok = s;
         while (*s && *s != ',' && *s != ' ' && *s != '\t') s++;
+
+        // Copied out so the token can be named in a message. One that does not
+        // fit is not a building type either, and falls through the digit test
+        // with its first few characters standing in for it.
+        char word[32];
+        int  len  = (int)(s - tok);
+        int  keep = len < (int)sizeof(word) ? len : (int)sizeof(word) - 1;
+        memcpy(word, tok, (size_t)keep);
+        word[keep] = '\0';
+
+        bool numeric = (keep == len);
+        for (const char* c = word; numeric && *c; c++)
+            if (*c < '0' || *c > '9') numeric = false;
+        if (!numeric)
+        {
+            Logf("battery  building_types: \"%s\" is not a number - ignored", word);
+            continue;
+        }
+
+        int type = atoi(word);
+
+        bool already = false;
+        for (int i = 0; i < g_typeCount; i++)
+            if (g_types[i] == type) already = true;
+        if (already)
+        {
+            Logf("battery  building_types: %d listed more than once - kept once", type);
+            continue;
+        }
+
+        if (g_typeCount >= cap)
+        {
+            Logf("battery  building_types: no room for %d - only %d types fit", type, cap);
+            continue;
+        }
+        g_types[g_typeCount++] = type;
     }
 }
 

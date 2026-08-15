@@ -288,6 +288,8 @@ struct MineState
 static MineState g_mine[MAX_MINE_STATES];
 static DWORD     g_mineTick;
 static LONG      g_pending;          // mines needing a seed or a write
+static DWORD     g_evictLast;        // last eviction WARN, so the tick stays quiet
+static int       g_evictions;
 static DWORD     g_tickThread;       // logged once, to settle which thread is which
 static DWORD     g_renderThread;
 
@@ -323,13 +325,27 @@ static MineState* MineStateFor(void* b)
     // and its quality of source with it. It takes a hash cluster of more than
     // 16 mines to happen at all and has never been seen, but it would look like
     // a deposit refilling itself, which is the kind of thing that gets reported
-    // as a mod bug with no way to explain it. So it says so.
+    // as a mod bug with no way to explain it. So it says so - once, and then at
+    // most once a minute. A cluster that is over its probe evicts on every pass
+    // of the mine tick, and the tick is arithmetic that cannot upset anything
+    // only for as long as it is not writing a line per mine per frame into the
+    // log. The running count is what makes the throttled line still useful:
+    // thrashing shows up as a number that climbs, not as one lost warning.
     if (freeSlot < 0 && g_mine[i].building &&
         (g_mine[i].state == MINE_ACTIVE || g_mine[i].state == MINE_EXHAUSTED))
-        Logf("deplete  WARN evicting live mine %p from the state table (%d slots, "
-             "16-slot probe) - it will be re-seeded from the current map and its "
-             "remaining-percentage will jump. Raise MAX_MINE_STATES.",
-             g_mine[i].building, MAX_MINE_STATES);
+    {
+        DWORD now = GetTickCount();
+        g_evictions++;
+        if (g_evictions == 1 || (DWORD)(now - g_evictLast) > 60000)
+        {
+            g_evictLast = now;
+            Logf("deplete  WARN evicting live mine %p from the state table (%d slots, "
+                 "16-slot probe) - it will be re-seeded from the current map and its "
+                 "remaining-percentage will jump. Raise MAX_MINE_STATES. "
+                 "(%d eviction(s) so far)",
+                 g_mine[i].building, MAX_MINE_STATES, g_evictions);
+        }
+    }
 
     memset(&g_mine[i], 0, sizeof(g_mine[i]));
     g_mine[i].building = b;

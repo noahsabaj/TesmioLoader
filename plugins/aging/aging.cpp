@@ -117,6 +117,13 @@ static int      g_lastDay = -1;
 static int      g_lastArm = -1;     // the day Arm last ran, so it runs at most daily
 static int      g_reports;
 static bool     g_armed;
+static int      g_emptyArms;        // re-arms in a row that found nobody to follow
+
+// A world where no Person ever reads back arms, follows nothing, reports
+// nothing and so never counts a day towards `days`. Rather than say so once a
+// day forever, it gives the world this many days to produce a citizen and then
+// finishes like any other run.
+#define MAX_EMPTY_ARMS 5
 
 // ---------------------------------------------------------------- reading
 
@@ -155,7 +162,10 @@ static int People(BYTE*** outBegin)
 
 // ---------------------------------------------------------------- the probe
 
-static void Arm(BYTE** begin, int count)
+// `announce` is false for the second and later re-arms of a world that keeps
+// handing back nobody: the line is worth printing when something changed, not
+// once a day for the rest of the session.
+static void Arm(BYTE** begin, int count, bool announce)
 {
     int want = g_people;
     if (want > MAX_PEOPLE) want = MAX_PEOPLE;
@@ -176,8 +186,9 @@ static void Arm(BYTE** begin, int count)
         g_tracked++;
     }
 
-    Logf("aging    following %d of %d citizen(s), offsets 0x%X..0x%X, %d day(s)",
-         g_tracked, count, g_from, g_to, g_days);
+    if (announce)
+        Logf("aging    following %d of %d citizen(s), offsets 0x%X..0x%X, %d day(s)",
+             g_tracked, count, g_from, g_to, g_days);
 }
 
 static bool Sane(float f)
@@ -276,14 +287,30 @@ static void Tick(void)
     // followed nobody, reported nothing, and never said why.
     // At most once per calendar day, or a map with no readable Person at all
     // would re-arm and log on every single frame.
+    // A re-arm that finds nobody is not a day's work: it returns before Report,
+    // so it never counts towards `days` and the run has no end of its own. The
+    // first one is worth hearing - a save is probably still loading - and after
+    // MAX_EMPTY_ARMS the probe stops instead of writing a line a day forever.
     if ((!g_armed || g_tracked == 0) && day != g_lastArm)
     {
-        if (g_armed) Logf("aging    every tracked citizen is gone - re-arming "
-                          "(a save was probably loaded)");
-        Arm(begin, count);
+        bool speak = !g_armed || g_emptyArms == 0;
+        if (g_armed && speak) Logf("aging    every tracked citizen is gone - re-arming "
+                                   "(a save was probably loaded)");
+        Arm(begin, count, speak);
         g_armed   = true;
         g_lastArm = day;
         g_lastDay = day;
+
+        if (g_tracked == 0)
+        {
+            if (++g_emptyArms >= MAX_EMPTY_ARMS)
+            {
+                Logf("aging    no citizen has been readable for %d day(s) - stopping.",
+                     g_emptyArms);
+                g_enabled = 0;
+            }
+        }
+        else g_emptyArms = 0;
         return;
     }
     if (g_tracked == 0) return;
