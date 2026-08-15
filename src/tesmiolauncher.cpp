@@ -41,11 +41,11 @@
 //
 // THE VERSION GATE. Every address the loader and its plugins patch belongs to
 // a build of the game, and the project was originally written against v1.1.1.7.
-// A regular-branch content update then shipped v1.1.1.9 - a new PE build (its
-// own TimeDateStamp) but, per the update notes, no change to game code, only to
-// content - so tesmioloader b0.3.6 recognises both builds rather than dropping
-// the old one: kSupportedVersions below is a table, not a single constant, and
-// either build reads as GV_OK. A patch site still verifies its own bytes before
+// A regular-branch update then shipped v1.1.1.9 - billed as content-only, but
+// the executable had in fact reflowed throughout, so every address was
+// re-derived and v1.1.1.7 went with its addresses: kSupportedVersions below is
+// a table for the day two builds genuinely share their code, and today it
+// holds exactly one entry. A patch site still verifies its own bytes before
 // it writes, so if a future update ever does move code, the affected hooks
 // refuse rather than corrupt the process - but that is a dozen separate
 // refusals in a log file nobody reads, after the game is already up. The
@@ -155,8 +155,9 @@ static const SupportedGameVersion kSupportedVersions[] = {
 #define GAME_VER_COUNT (sizeof(kSupportedVersions) / sizeof(kSupportedVersions[0]))
 
 // The text every message that used to say "v" GAME_VER_TEXT now says instead -
-// built on first use from the table above so a third entry never needs a
-// second edit anywhere else in this file. "v1.1.1.7 or v1.1.1.9".
+// built on first use from the table above so a second entry never needs a
+// second edit anywhere else in this file. With one entry it reads "v1.1.1.9";
+// with two it would read "v1.1.1.9 or v1.1.1.10".
 static const wchar_t* SupportedVersionsText()
 {
     static wchar_t text[64];
@@ -819,7 +820,7 @@ struct PluginEntry
 // does not verify, so the bytes changed after somebody signed them.
 #define TSM_SIG_NONE 0      // no <name>.dll.sig beside the DLL
 #define TSM_SIG_OK   1      // the signature verifies against TSM_PUBLIC_KEY
-#define TSM_SIG_BAD  2      // a .sig is there and does not verify
+#define TSM_SIG_BAD  2      // a .sig is there and does not verify, or would not read
 static PluginEntry g_plug[MAX_PLUGINS];
 static int         g_plugCount;
 static bool        g_host = true;       // [tesmioloader] plugins
@@ -842,9 +843,19 @@ static void SetIniPath(const wchar_t* dllDir)
 {
     Join(g_ini, _countof(g_ini), dllDir, LOADER_INI);
 
+    // On a machine with "Use Unicode UTF-8 worldwide" ticked the ACP is 65001,
+    // and then there is nothing to detect: UTF-8 encodes every path there is,
+    // so the ANSI spelling always round-trips. Worse, asking anyway is fatal -
+    // WideCharToMultiByte REFUSES a UTF-8 target outright when lpUsedDefaultChar
+    // is non-NULL, and the launcher used to read that refusal as "cannot be
+    // expressed at all", blank the ANSI path, and lose every [plugins] read and
+    // write on exactly the systems where the path was fine. The question is
+    // only worth asking of a real legacy codepage.
+    bool utf8Acp = (GetACP() == CP_UTF8);
+
     BOOL lossy = FALSE;
     int n = WideCharToMultiByte(CP_ACP, 0, g_ini, -1, g_iniA, sizeof(g_iniA),
-                                NULL, &lossy);
+                                NULL, utf8Acp ? NULL : &lossy);
     if (n == 0)
     {
         g_iniA[0] = 0;
@@ -903,6 +914,14 @@ static bool QueryPluginApiVersion(const wchar_t* fullPath, unsigned* out)
 // this binary was built with. The signature covers the DLL exactly as it sits
 // on disk, so editing the file - one byte is enough - turns a valid seal into
 // TSM_SIG_BAD, while deleting the .sig turns it into the honest TSM_SIG_NONE.
+//
+// A .sig that exists but cannot be READ - the DLL locked by an antivirus, a
+// half-finished copy, a permission the user does not have - also comes back
+// BAD, and that is a choice rather than an oversight. Once a seal is present,
+// "these bytes do not match it" and "these bytes could not be looked at" say
+// the same amount about the file, which is nothing good, and BAD is the half
+// that refuses to run it. The cost is a locked plugin sitting out one launch;
+// the cure is to unlock it and start the launcher again.
 #if TSM_LAUNCHER_SIGNING
 static int CheckPluginSignature(const wchar_t* dllPath)
 {
@@ -919,6 +938,7 @@ static int CheckPluginSignature(const wchar_t* dllPath)
     _snwprintf_s(sigPath, _countof(sigPath), _TRUNCATE, L"%s.sig", dllPath);
     if (!Exists(sigPath)) return TSM_SIG_NONE;
 
+    // BAD unless something below proves otherwise - including the reads.
     int result = TSM_SIG_BAD;
 
     size_t sigFileLen = 0;
@@ -1080,11 +1100,12 @@ static void ScanPlugins(const wchar_t* dllDir)
         // about what ticking it does. See tesmio_api.h on TSM_API_VERSION_MIN.
         //
         // A file carrying a signature that does NOT verify is never loaded.
-        // Somebody signed those bytes and the bytes then changed, which is the
-        // one case where refusing to execute it costs nothing: the launcher
-        // still lists it, still marks it red, and the loader still makes its
-        // own decision - this only declines to run it here, to find out a
-        // version number the window would print in brackets.
+        // Somebody signed those bytes and the bytes then changed, so it is not
+        // run even for the small reason it would have been run for: a version
+        // number the window prints in brackets. It is still listed and still
+        // marked red - but with no version there is no apiOk, the box goes off
+        // below, and SaveConfig writes that off into the ini. The decision is
+        // not just for this run: it sits there until the user ticks it back on.
         if (e->sig == TSM_SIG_BAD)
         {
             e->apiKnown = false;
@@ -1212,11 +1233,18 @@ static bool Inject(const wchar_t* gameFull, const wchar_t* dllFull)
                 DWORD waited = WaitForSingleObject(th, 30000);
                 DWORD loaded = 0;
 
-                if (waited != WAIT_OBJECT_0)
+                if (waited == WAIT_FAILED)
                 {
-                    Msg(L"LoadLibraryW did not finish within 30 s (%s) - "
-                        L"the game will not be started",
-                        waited == WAIT_TIMEOUT ? L"timed out" : L"wait failed");
+                    // Not a timeout - the wait itself did not work, and the
+                    // only thing that says why is GetLastError, so this goes
+                    // out the same way every other failure here does.
+                    Fail(L"WaitForSingleObject(remote thread)");
+                    Msg(L"the game will not be started");
+                }
+                else if (waited != WAIT_OBJECT_0)
+                {
+                    Msg(L"LoadLibraryW did not finish within 30 s - "
+                        L"the game will not be started");
                 }
                 else if (!GetExitCodeThread(th, &loaded))
                 {
@@ -1940,6 +1968,23 @@ static bool ShowWindowUi(const wchar_t* gameFull)
 
 // ---------------------------------------------------------------- entry
 
+// wcscpy_s calls the invalid-parameter handler when the source does not fit,
+// and the default handler TERMINATES the process - so a --game with a path
+// longer than MAX_PATH used to kill the launcher outright instead of reporting
+// anything. Truncation is refused explicitly and said out loud.
+//
+// A function and not a macro because every call site passes argv[++i]. A macro
+// naming its argument twice stepped i twice: --game <path> --nogui swallowed
+// the --nogui, and --game <path> at the end of the line walked off into
+// argv[argc], which CommandLineToArgvW does not promise anything about.
+static void ArgCopy(wchar_t* dst, const wchar_t* src, const wchar_t* what)
+{
+    if (wcslen(src) >= MAX_PATH)
+        Msg(L"%s path is longer than %d characters - ignored", what, MAX_PATH - 1);
+    else
+        wcscpy_s(dst, MAX_PATH, src);
+}
+
 int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 {
     GoDpiAware();
@@ -1959,23 +2004,10 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     bool    findOnly       = false;
     bool    ignoreVersion  = false;
 
-    // wcscpy_s calls the invalid-parameter handler when the source does not
-    // fit, and the default handler TERMINATES the process - so a --game with a
-    // path longer than MAX_PATH used to kill the launcher outright instead of
-    // reporting anything. Truncation is refused explicitly and said out loud.
-    #define TSM_ARG_COPY(dst, src, what)                                        \
-        do {                                                                    \
-            if (wcslen(src) >= MAX_PATH)                                        \
-                Msg(L"%s path is longer than %d characters - ignored",          \
-                    what, MAX_PATH - 1);                                        \
-            else                                                                \
-                wcscpy_s(dst, MAX_PATH, src);                                   \
-        } while (0)
-
     for (int i = 1; argv && i < argc; i++)
     {
-        if (!_wcsicmp(argv[i], L"--game") && i + 1 < argc) TSM_ARG_COPY(game, argv[++i], L"--game");
-        else if (!_wcsicmp(argv[i], L"--dll") && i + 1 < argc) TSM_ARG_COPY(dll, argv[++i], L"--dll");
+        if (!_wcsicmp(argv[i], L"--game") && i + 1 < argc) ArgCopy(game, argv[++i], L"--game");
+        else if (!_wcsicmp(argv[i], L"--dll") && i + 1 < argc) ArgCopy(dll, argv[++i], L"--dll");
         else if (!_wcsicmp(argv[i], L"--nogui")) gui = false;
         else if (!_wcsicmp(argv[i], L"--find")) { findOnly = true; gui = false; }
         else if (!_wcsicmp(argv[i], L"--ignore-version")) ignoreVersion = true;
@@ -1993,8 +2025,6 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
             return 0;
         }
     }
-
-    #undef TSM_ARG_COPY
 
     // Nothing below reads argv again.
     if (argv) { LocalFree(argv); argv = NULL; }
