@@ -11,8 +11,10 @@ started however idle the office is and however many vehicles it has parked. The 
 of this plugin is `office_range` — make that reach yours.
 
 **The range is found and the feature works.** It is a plain `int` on the construction
-office itself, at `building+0xFC8` — the very number the office's own window prints as
-`<3,500m`. So there is no spliced code and no repointed constant in the range write at
+office itself, at `building+0xFC8` — the very number the office's own window prints,
+`<1,000m` on a freshly built office. (3500 is where the `+` button *stops*, not where an
+office starts; see [Which offices get set, and why 1000](#which-offices-get-set-and-why-1000).)
+So there is no spliced code and no repointed constant in the range write at
 all — `write_range` sets the field, which is as robust as anything in this project
 gets, because there is no address for a game update to move. That claim is about
 `write_range` alone; the window ceiling below is a code patch and says so. Confirmed
@@ -124,13 +126,21 @@ object for the second.
 
 ## Where the range lives
 
-**On the office, at `building+0xFC8`, as a plain `int` in metres.** Two unrelated
-methods say so, which is worth more than either on its own:
+**On the office, at `building+0xFC8`, as a plain `int` in metres.** Three readings say
+so, which is worth more than any one of them on its own:
 
 | | Evidence |
 |---|---|
 | the probe | 3500 occurred at exactly one offset in the office object, the same offset in all sixteen offices on the test map, and nowhere in the type descriptor. Clicking the window's `−` and `+` moved that slot and nothing else |
-| the disassembly | the office window's own validator names the displacement outright while pinning the field to 3500 — `mov [rsi+0xFC8],3500` |
+| the disassembly | the office window's own clamp names the displacement outright while pinning the field to 3500 — `mov [rsi+0xFC8],3500` |
+| **the fresh map** (2026-08-15) | with `write_range = 0` and `raise_ceiling = 0`, a newly built office on a brand-new map read **`<1,000m`** in its own window before any button was touched — and the probe, hunting 3500 in that office, found it nowhere |
+
+Read them for what each actually establishes. The first two agree on the **offset**, and
+that is the finding: `+0xFC8` is the range. Neither of them establishes the **birth
+value**, though both were once read as if they did — the sixteen offices were a save
+whose offices had all been ridden to the `+` button's top by hand, and `mov
+[rsi+0xFC8],3500` is that button's clamp. The fresh map is the only reading that ever
+looked at an untouched office, and it says 1000.
 
 That is what `write_range` sets, and it is why the feature has no address to lose:
 a field on an object the game hands us is not a location in `.text` that a rebuild
@@ -263,14 +273,14 @@ verdict is *"not on the `Person`"*, never *"not in the game"*.
 | `enabled` | 1 | 0 unloads the plugin without reading anything |
 | **`write_range`** | **1** | **set the office's range field. This is the feature** |
 | **`office_range`** | **10000** | **metres of reach. The point of the plugin** |
-| `game_default` | **3500** | what an untouched office starts at. Only an office still carrying this — or `written_range` — is set, which is what makes `office_range` a default rather than a cage. 0 holds *every* office on every frame and the `−` button then cannot lower one |
+| `game_default` | **1000** | what an untouched office starts at — the number a freshly built office's own window prints, not the 3500 its `+` button stops at. Only an office still carrying this — or `written_range` — is set, which is what makes `office_range` a default rather than a cage. 0 holds *every* office on every frame and the `−` button then cannot lower one |
 | `written_range` | *absent* | the plugin's own bookkeeping, not a knob. It writes back the value it last set, so an office still holding that is recognised next session as the plugin's work and follows `office_range` when you change it. Anything outside 100…20000 is treated as "no earlier value", which is also what a first run looks like |
 | `raise_ceiling` | 1 | lift the 3500 the window's `+` button stops at |
 | `ceiling` | 10000 | what it stops at instead. Clamped to 3500…20000 — the same upper bound as `office_range`, because a value above it is one `write_range` would then refuse as implausible |
 | `probe` | 1 | bracket the range and hunt for it. Diagnostic now, not a step you have to run |
 | `patch` | 0 | the code-patch route. Needs an address in a site table, and both are empty |
 | `office_limit` | 0 | jobs one office will take on, if the gate is a count. 0 is no cap |
-| `probe_expect` | 3500 | the value to hunt for inside an office |
+| `probe_expect` | 1000 | the value to hunt for inside an office |
 | `probe_diff` | 1 | report every 4-byte slot of an office that changed since the last report |
 | `probe_from`, `probe_to` | 768, 6144 | which part of an office to compare |
 | `probe_period` | 5 | seconds between reports |
@@ -287,7 +297,7 @@ offices are tracked; a map with more says so in the log rather than ignoring the
 in silence. It was 16, which is a probe-era number — the author's own map carries 17
 offices, and the seventeenth silently never got its range set.
 
-### Which offices get set, and why 3500
+### Which offices get set, and why 1000
 
 Two kinds, and only two:
 
@@ -307,22 +317,34 @@ every office the plugin has ever touched reads as hand-adjusted the moment you c
 With it, lowering `office_range` walks the plugin's own offices back down — nothing
 in the write path is raise-only.
 
-**`game_default` ships as 3500** on two pieces of evidence: 3500 is what the
-pre-write probe read out of `+0xFC8` on every office it ever looked at, and it is
-what the executable's own validator puts there — `mov [rsi+0xFC8],3500`, the same
-instruction that names the offset. **1000 sat here for a while and was wrong**, and
-its provenance is worth writing down because it is the sort of number that looks
-sourced. It came off the `+`/`−` button ladder — `100 → r9d → 2000 → 3000 → ceiling`,
-where `r9d` is the one rung the handler computes at run time rather than carrying as
-an immediate, so the disassembly does not name it. 1000 was a guess at that rung. It
-is not one of the rungs, and it was never a value any office was observed starting
-at; two different unsourced things at once.
+**`game_default` ships as 1000**, settled on 2026-08-15 by the only reading that could
+settle it: both of this plugin's writes switched off, a brand-new map, one freshly built
+office, and its own window read `<1,000m` before anything had touched it. The probe,
+running in that same office, hunted 3500 and found it nowhere.
 
-The one-minute check that would finish the argument, on a fresh map: set
-`write_range = 0` and `raise_ceiling = 0`, start a new map, build one construction
-office and read the number in its own window. If it says something other than 3500,
-exactly two literals move — the default in `construction.cpp` and the `game_default`
-line in `construction.ini`.
+The number reached that value the long way round, and the wrong turns are worth keeping
+because each is a way of mistaking a strong reading for the reading you wanted:
+
+- **3500 sat here and was wrong.** It had two pieces of evidence behind it, which is why
+  it was convincing. The probe read 3500 out of `+0xFC8` on all sixteen offices of the
+  test map — but that was a *save*, and its offices had every one of them been ridden to
+  the `+` button's top by hand, so the sixteen agreed about the player's habits and not
+  about the game. And the executable's own `mov [rsi+0xFC8],3500` is the **button
+  clamp**: where `+` stops, not where an office is born. Two readings agreeing is worth
+  more than either — but only about the thing they both actually measured, which was the
+  offset.
+- **1000's own first stay here was a guess**, off the `+`/`−` button ladder
+  (`100 → r9d → 2000 → 3000 → ceiling`, where `r9d` is the one rung the handler computes
+  at run time rather than carrying as an immediate, so the disassembly does not name it).
+  It is not that rung. It happened to be the right number for the wrong reason, which is
+  not the same as having been right.
+
+The check takes a minute and is worth re-running on your own build, or on any build where
+the game has changed: set `write_range = 0` and `raise_ceiling = 0`, start a new map,
+build one construction office and read the number in its own window before touching
+anything. That is `game_default`. If it says something other than 1000, exactly two
+literals move — the default in `construction.cpp` and the `game_default` line in
+`construction.ini`.
 
 ## What a save keeps
 
@@ -358,7 +380,7 @@ plugin   construction     1.0      from construction.dll
 construct  game object 0x9D4F10 confirmed by the lea at 0x43970A
 construct  ceiling: 7 of 7 site(s) raised from 3500 to 10000 - the office window's
            + button now goes that far
-construct  ready: a construction office starting at the game's 3500 m will be set to
+construct  ready: a construction office starting at the game's 1000 m will be set to
            10000 m (its own window stops at 10000, and lowering one by hand sticks)
 construct  612 building(s), 0 with no readable type
 construct  types on this map: 2 x381  3 x44  6 x22  12 x3  28 x1  43 x2
@@ -382,9 +404,9 @@ Then the writes themselves. One line per office, on the first pass that touches 
 and one line for the pass:
 
 ```
-construct  range: office 0000029F4C8A1200 was at 3500 m, set to 10000 m
-construct  range: office 0000029F4C8B7A80 was at 3500 m, set to 10000 m
-construct  range: 2 office(s) at the game's default of 3500 raised to 10000 m -
+construct  range: office 0000029F4C8A1200 was at 1000 m, set to 10000 m
+construct  range: office 0000029F4C8B7A80 was at 1000 m, set to 10000 m
+construct  range: 2 office(s) at the game's default of 1000 raised to 10000 m -
            lower any of them in its own window and it stays lowered
 construct  range: written_range = 10000 noted in construction.ini - an office holding
            that is this plugin's own work, and follows office_range the next time you
@@ -400,11 +422,11 @@ The second session, after you have edited `office_range` down to 8000, is where
 follow:
 
 ```
-construct  ready: an office starting at the game's 3500 m, or still holding the 10000
+construct  ready: an office starting at the game's 1000 m, or still holding the 10000
            this plugin wrote last, will be set to 8000 m (its own window stops at
            10000, and lowering one by hand sticks)
 construct  range: office 0000029F4C8A1200 was at 10000 m, set to 8000 m
-construct  range: 2 office(s) set to 8000 m - the ones still at the game's 3500, and
+construct  range: 2 office(s) set to 8000 m - the ones still at the game's 1000, and
            the ones still holding the 10000 this plugin wrote last. Lower any of them
            in its own window and it stays lowered.
 ```
@@ -502,6 +524,11 @@ confirmed independently by disassembly, where the office window's own clamp name
 displacement outright while pinning it to 3500. Two unrelated methods agreeing is worth
 more than either. An office set through `write_range` really does reach that far: a site
 about 9 km out is picked up automatically and the road overlay extends to match.
+
+What those two agreed about was the *offset*. The fresh-map check on 2026-08-15 later
+showed that the sixteen offices had all been ridden to the `+` button's top by hand and
+that 3500 is that button's clamp: an office is born at **1000**, which is what
+`game_default` now ships as.
 
 The seven ceiling sites are verified byte for byte against this build before any is
 written, and the `+` button reaches `ceiling` afterwards.
