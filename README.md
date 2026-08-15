@@ -2,26 +2,58 @@
 
 [Changelog](changelog.md) | [Журнал обновлений](changelog_ru.md)
 
-[Documentation](https://maxlegend.github.io/TesmioLoaderDocs/#/getting-started) | [Документация](https://maxlegend.github.io/TesmioLoaderDocs/#/getting-started/RU)
+# tesmioloader — Noah Sabaj's fork
 
-## A new era of modding begins here
+A mod loader for *Workers & Resources: Soviet Republic*. It starts the game for
+you and, while the game is starting, patches it in memory: new resources, new
+deposits, new buildings, changed rules. It never modifies a file the game came
+with, so Steam's file verification has nothing to complain about.
 
-**Hello, comrade!**
+This is a personal fork, decoupled from upstream and maintained independently by
+Noah Sabaj. It goes its own way — its own plugins, its own docs, its own release
+pace — and it does not track upstream's branches.
 
-I'm pleased to present my custom loader for the game WRSR. It allows you to truly modify the game through code injection — adding new resources, including new deposits on the map, as well as full-fledged interaction with those new resources. I'm more than confident that this loader is the beginning of a future of large-scale and genuine modding. In the long run, it opens up possibilities across a wide range of game improvements that players have long dreamed of:
-- Modding infrastructure, roads, footpaths, fences
-- Changing economic formulas, modifying pathfinding formulas and algorithms
-- Modifying travel range, resident working hours
-- Modifying road placement algorithms
-- And finally, even adding new mechanics and much, much more
+Every address this build patches belongs to one build of the game: **v1.1.1.9**.
+The launcher reads the version out of `SOVIET64.exe` before the process exists
+and refuses to launch anything else, because injecting confidently into a game
+you cannot patch only produces a crash further down the road. `version_check = 0`
+in `tesmioloader.ini`, or `--ignore-version`, turns that refusal back into a
+warning for whoever is porting to a new build.
 
-The mod will require manual installation: copy the folder to the game root directory, next to media_soviet. After that, open the folder and run the loader — tesmiolauncher.exe. Steam must also be running — the launcher simply runs the same SOVIET64.exe, injecting my tesmioloader.dll library, which contains the patching code.
-The modification works on the principle of hooks — the executable binary is patched during the game's loading process. When launching the game normally through Steam, the unmodified version runs.
+## Credit
 
-The default version includes a set of the loader itself and two plugins for testing copper production chain (optional) - this is the resource and deposits plugin (resources.dll and deposits.dll) and the corresponding configuration files next to them.
+Built on **Tesmio's TesmioLoader** — https://github.com/MaxLegend/TesmioLoader.
+The injection, the VFS, the hooking, the whole idea that this game can be modded
+through code at all: that is his work, and this fork does not exist without him.
+His own links, if you want to support him or watch what he builds next: Boosty
+https://boosty.to/tesmio/donate and YouTube https://www.youtube.com/@tesmio.
 
-This was no easy task, so please support me on Boosty — https://boosty.to/tesmio/donate
+## Install
 
-The launcher is distributed under the GNU GPL v3 license. The full license text is available here → https://choosealicense.com/licenses/gpl-3.0/  
+1. Make sure Steam is running. The launcher starts the real game underneath; it
+   does not replace Steam.
+2. Run `tesmioloader\build\tesmiolauncher.exe` — **not** `SOVIET64.exe`. Starting
+   the game the normal way through Steam runs the unmodified version.
+3. The window shows the game path it found (it looks through your Steam library
+   folders); if it is wrong or empty, click **Browse...** and point it at
+   `SOVIET64.exe` or the folder holding it.
+4. Tick the plugins you want this session, then press **Launch**.
 
-Additionally, I am also developing a new game called Socialist Union. You can find more details in the development diaries on my YouTube channel — https://www.youtube.com/@tesmio
+Plugins install by hand, and this is the step people miss: a plugin's `.dll` and
+its `.ini` go in `tesmioloader\build\plugins\` and nowhere else. Subscribing to
+an item on the Steam Workshop downloads the files, it does not install them —
+you still have to copy them into that folder yourself.
+
+The rest is in `docs/`: [docs/guide/00-getting-started.md](docs/guide/00-getting-started.md)
+for players (launching, editing an `.ini` safely, reading the log), and
+[docs/01-architecture.md](docs/01-architecture.md) onward for how it works
+inside.
+
+## Plugins
+
+Every feature is a separate DLL. Removing one is deleting its file. The full
+list, with a doc page for each, is in [docs/09-plugins.md](docs/09-plugins.md).
+
+## License
+
+GNU GPL v3. The full text is in [LICENSE](LICENSE) in this repository.

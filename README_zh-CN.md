@@ -1,24 +1,52 @@
 [English](README.md) | [Русский](README_RU.md) | [简体中文](README_zh-CN.md)
 
-## 模组新时代由此开启
+[Changelog](changelog.md) | [Журнал обновлений](changelog_ru.md)
 
-**你好，同志！**
+# tesmioloader — Noah Sabaj 的分支
 
-我很高兴向大家展示我为《WRSR》游戏开发的自定义加载器。它通过代码注入实现对游戏的深度修改——可添加全新资源，包括地图上的新矿脉，并支持对这些资源的完整交互。我坚信，这个加载器将成为大规模、真正意义上的模组开发的开端。从长远来看，它为玩家期盼已久的各类游戏优化铺平了道路：
+一个用于《Workers & Resources: Soviet Republic》的模组加载器。它替你启动游戏，并在
+游戏启动的过程中于内存中打补丁：新的资源、新的矿脉、新的建筑、改动过的规则。它不会
+修改游戏自带的任何文件，所以 Steam 的文件完整性校验不会有任何意见。
 
-- 自定义基础设施、人行道、围栏
-- 调整经济公式，修改寻路逻辑与算法
-- 更改出行范围、公民工作时长
-- 修改道路铺设算法
-- 乃至添加全新机制，以及更多更多可能
+这是一个个人分支，已与上游解耦，由 Noah Sabaj 独立维护。它走自己的路——自己的插件、
+自己的文档、自己的发布节奏——并不跟随上游的分支。
 
-该模组需手动安装：请将文件夹复制到游戏根目录，与media_soviet文件夹并列。然后打开该文件夹并运行启动器——tesmiolauncher.exe。同时请确保已启动Steam，该启动器会调用原版的SOVIET64.exe，并注入我的tesmioloader.dll库文件，其中包含了补丁代码。
-该加载器基于钩子（Hook）原理实现——在游戏加载过程中对可执行文件进行补丁注入。若通过 Steam 正常启动游戏，运行的则是未修改的原版程序。
+这个版本所打的每一个地址都属于同一个游戏版本：**v1.1.1.9**。启动器会在游戏进程存在
+之前先从 `SOVIET64.exe` 中读出版本号，其他版本一律拒绝启动：明知打不了补丁却仍然自信
+注入，只是把崩溃推迟到更晚而已。在 `tesmioloader.ini` 中设置 `version_check = 0`，
+或使用 `--ignore-version` 参数，可以把这个拒绝重新变回一句警告——留给正在向新版本移植
+的人。
 
-默认包含加载器本身及两个用于测试铜生产链的插件（可选）——即资源与矿脉插件（resources.dll 和 deposits.dll），以及与之配套的配置文件。
+## 致谢
 
-这是一项艰难的工作，您可以在 Boosty 上支持我 — https://boosty.to/tesmio/donate
+基于 **Tesmio 的 TesmioLoader** — https://github.com/MaxLegend/TesmioLoader。
+注入、VFS、钩子，乃至“这款游戏可以通过代码来修改”这个想法本身，都是他的成果；没有他，
+就没有这个分支。这是他本人的链接，如果你想支持他或看看他接下来在做什么：Boosty
+https://boosty.to/tesmio/donate 与 YouTube https://www.youtube.com/@tesmio。
 
-该加载器使用 GNU GPL v3 许可证发布。完整许可内容见 → https://choosealicense.com/licenses/gpl-3.0/
+## 安装
 
-此外，我还在开发一款名为 Socialist Union 的新游戏。更多详情，请查看我YouTube频道上的开发日志 — https://www.youtube.com/@tesmio
+1. 确保 Steam 正在运行。启动器是在其下方启动真正的游戏，并不会取代 Steam。
+2. 运行 `tesmioloader\build\tesmiolauncher.exe`——**不是** `SOVIET64.exe`。通过
+   Steam 正常启动，运行的是未经修改的游戏。
+3. 窗口会显示它找到的游戏路径（它会遍历你的 Steam 库文件夹）；如果路径不对或为空，
+   点击 **Browse...**，指向 `SOVIET64.exe` 或它所在的文件夹。
+4. 勾选本次游玩想启用的插件，然后按 **Launch**。
+
+插件需要手动安装，而这一步正是大家最容易漏掉的：插件的 `.dll` 及其 `.ini` 要放进
+`tesmioloader\build\plugins\`，不能放在别处。在 Steam 创意工坊订阅只会下载文件，并不会
+安装它们——你仍然需要自己把文件复制到那个文件夹里。
+
+其余内容都在 `docs/` 中：面向玩家的
+[docs/guide/00-getting-started.md](docs/guide/00-getting-started.md)（启动、安全地
+编辑 `.ini`、查看日志），以及 [docs/01-architecture.md](docs/01-architecture.md)
+起的各章，讲的是它内部如何工作（这些章节仅有英文版）。
+
+## 插件
+
+每一项功能都是一个独立的 DLL。要去掉某项功能，删掉它的文件即可。完整列表以及每个插件
+对应的文档页，见 [docs/09-plugins.md](docs/09-plugins.md)。
+
+## 许可证
+
+GNU GPL v3。完整文本见本仓库中的 [LICENSE](LICENSE) 文件。
