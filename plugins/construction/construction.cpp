@@ -407,19 +407,21 @@ static int g_writeRange = 1;
 // this plugin raises - which is what makes office_range a DEFAULT rather than a
 // value the plugin holds you to.
 //
-// 3500, because 3500 is what the pre-write probe read out of +0xFC8 on every
-// office it ever looked at, and what the executable's own validator pins the
-// field to - `mov [rsi+0xFC8],3500`, up at RVA_CLAMP_SET_A. 1000 sat here for a
-// while and was wrong: a guess at the ladder's one run-time rung (the rungs the
-// disassembly names are 100, 2000 and 3000), never a value any office was
-// observed starting at.
+// 1000, read off a newly built office's own window on a fresh map with both of
+// this plugin's writes switched off - the one reading nothing could have
+// contaminated. The number flip-flopped on the way here: 1000 began as a
+// guess, was swapped for 3500 on the strength of sixteen probed offices, and
+// came back when the fresh map showed what those sixteen were - a save whose
+// offices had all been ridden to the button ceiling by hand. 3500 is where the
+// stock + button STOPS - `mov [rsi+0xFC8],3500`, the clamp at RVA_CLAMP_SET_A -
+// not where an office begins.
 //
 // 0 means "no such test": every office is held at office_range every frame,
 // and the minus button in its window then cannot lower it, because the next
 // frame puts the value straight back. That was version 0.1's behaviour and it
 // was wrong - it was insurance against a re-clamp the game turns out not to
 // do.
-static int g_gameDefault = 3500;
+static int g_gameDefault = 1000;
 
 // The other kind: an office holding the value THIS PLUGIN last wrote.
 //
@@ -447,7 +449,7 @@ static int g_writtenRange = 0;
 // beats inferring one from behaviour by a wide margin.
 //
 // 0 turns the hunt off.
-static int g_probeExpect = 3500;
+static int g_probeExpect = 1000;
 
 // Report every 4-byte slot of an office that changed since the last report,
 // which is what turns a list of candidates into an answer: click the + or the
@@ -954,13 +956,12 @@ static void WriteRanges(void)
         // Decided once, and never reconsidered - but ONLY in default mode.
         //
         // This is the fix for a bug that was mine: the rule used to be "raise
-        // anything sitting at the game's default" with 1000 written down as
-        // that default - a guess, and any guess the ladder can land an office
-        // on sets the same trap: stepping one down by hand looks identical to
-        // a freshly built one, and the plugin puts it straight back to 10000,
-        // cycling the minus button for ever. "Have we already made a decision
-        // about this office" is the honest question, and the value alone could
-        // never answer it.
+        // anything sitting at the game's default", and the default is a value
+        // a hand-lowered office can come back to - so stepping one down looked
+        // identical to a freshly built one, and the plugin put it straight
+        // back to 10000, cycling the minus button for ever. "Have we already
+        // made a decision about this office" is the honest question, and the
+        // value alone could never answer it.
         //
         // With `game_default = 0` there is no such question to ask: the
         // documented behaviour there is that every office is HELD at
