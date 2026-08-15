@@ -1,8 +1,10 @@
 # Construction offices — how far one reaches for work
 
 **A plugin**, not part of the loader: `plugins/construction/construction.cpp` builds
-to `build/plugins/construction.dll`, and deleting that DLL restores the base game
-exactly. See [09-plugins.md](09-plugins.md) for the mechanism.
+to `build/plugins/construction.dll`. Deleting that DLL stops the plugin doing
+anything further; it does not undo what it already did, because the range lives in
+the save — see [What a save keeps](#what-a-save-keeps). See
+[09-plugins.md](09-plugins.md) for the mechanism.
 
 A construction office only picks up jobs near itself, so a site across town is never
 started however idle the office is and however many vehicles it has parked. The point
@@ -10,9 +12,11 @@ of this plugin is `office_range` — make that reach yours.
 
 **The range is found and the feature works.** It is a plain `int` on the construction
 office itself, at `building+0xFC8` — the very number the office's own window prints as
-`<3,500m`. So there is no spliced code and no repointed constant in the feature at all:
-`write_range` sets the field, which is as robust as anything in this project gets,
-because there is no address for a game update to move. Confirmed in a running game: a
+`<3,500m`. So there is no spliced code and no repointed constant in the range write at
+all — `write_range` sets the field, which is as robust as anything in this project
+gets, because there is no address for a game update to move. That claim is about
+`write_range` alone; the window ceiling below is a code patch and says so. Confirmed
+in a running game: a
 site about 9 km from an office is picked up automatically and the yellow road overlay
 extends to match, and the simulation does not clamp the value back.
 
@@ -20,7 +24,7 @@ Two smaller pieces sit either side of it:
 
 | | |
 |---|---|
-| **the window ceiling** | The `+` button stopped at 3500 because of `imm32` clamps and a fixed rung ladder baked into the button handlers — not a constant read from anywhere. `raise_ceiling` lifts the top rung so the value stays adjustable by hand. Seven sites, all verified before any is written. |
+| **the window ceiling** | The `+` button stopped at 3500 because of `imm32` clamps and a fixed rung ladder baked into the button handlers — not a constant read from anywhere. `raise_ceiling` lifts the top rung, so the buttons step up the same ladder and stop somewhere higher; they were never freely adjustable and are not now. Seven sites, all verified before any is written, and `ceiling = 3500` verifies all seven and writes none of them. |
 | **the probe** | Still here, still useful, now purely diagnostic. It is what found `+0xFC8`, and it is what would find the field again after a game update moved it. |
 
 `patch` and the two site tables under [Where the range lives](#where-the-range-lives)
@@ -120,17 +124,31 @@ object for the second.
 
 ## Where the range lives
 
+**On the office, at `building+0xFC8`, as a plain `int` in metres.** Two unrelated
+methods say so, which is worth more than either on its own:
+
+| | Evidence |
+|---|---|
+| the probe | 3500 occurred at exactly one offset in the office object, the same offset in all sixteen offices on the test map, and nowhere in the type descriptor. Clicking the window's `−` and `+` moved that slot and nothing else |
+| the disassembly | the office window's own validator names the displacement outright while pinning the field to 3500 — `mov [rsi+0xFC8],3500` |
+
+That is what `write_range` sets, and it is why the feature has no address to lose:
+a field on an object the game hands us is not a location in `.text` that a rebuild
+can move.
+
+The **code-patch route** is a different thing and it is still unbuilt:
+
 | Group | Role | Site | Value |
 |---|---|---|---|
-| `range` | office pickup range | — | *not found yet* |
-| `cap` | office assignment count | — | *not found yet* |
+| `range` | office pickup range | — | *no address* |
+| `cap` | office assignment count | — | *no address* |
 
-Filled in by the probe. Until then `patch = 1` logs `no address for ... yet` and
-writes nothing.
-
-Two groups rather than one because they are independent findings. A group is verified
-whole before a single byte of it is written — if the simulation's copy of the range
-verifies and the office panel's does not, neither is touched.
+`patch = 1` logs `no address for ... yet` and writes nothing. Both tables are kept
+deliberately: a future game version could make the field read-only and force the
+question back to a code patch. Two groups rather than one because they are
+independent findings — a group is verified whole before a single byte of it is
+written, so if the simulation's copy of the range verifies and the office panel's
+does not, neither is touched.
 
 ## How the probe finds the list
 
@@ -245,7 +263,8 @@ verdict is *"not on the `Person`"*, never *"not in the game"*.
 | `enabled` | 1 | 0 unloads the plugin without reading anything |
 | **`write_range`** | **1** | **set the office's range field. This is the feature** |
 | **`office_range`** | **10000** | **metres of reach. The point of the plugin** |
-| `game_default` | 1000 | what an untouched office starts at. Only an office still carrying this is raised, which is what makes `office_range` a default rather than a cage. 0 holds *every* office on every frame and the `−` button then cannot lower one |
+| `game_default` | **3500** | what an untouched office starts at. Only an office still carrying this — or `written_range` — is set, which is what makes `office_range` a default rather than a cage. 0 holds *every* office on every frame and the `−` button then cannot lower one |
+| `written_range` | *absent* | the plugin's own bookkeeping, not a knob. It writes back the value it last set, so an office still holding that is recognised next session as the plugin's work and follows `office_range` when you change it. Anything outside 100…20000 is treated as "no earlier value", which is also what a first run looks like |
 | `raise_ceiling` | 1 | lift the 3500 the window's `+` button stops at |
 | `ceiling` | 10000 | what it stops at instead. Clamped to 3500…20000 — the same upper bound as `office_range`, because a value above it is one `write_range` would then refuse as implausible |
 | `probe` | 1 | bracket the range and hunt for it. Diagnostic now, not a step you have to run |
@@ -263,25 +282,84 @@ verdict is *"not on the `Person`"*, never *"not in the game"*.
 breadth-first over the road graph, so the work grows with the square of the limit.
 
 `write_range` and `probe` share one hook and either one installs it, so turning the
-probe off does not turn the feature off. At most `MAX_OFFICES` (16) construction
+probe off does not turn the feature off. At most `MAX_OFFICES` (**64**) construction
 offices are tracked; a map with more says so in the log rather than ignoring the rest
-in silence.
+in silence. It was 16, which is a probe-era number — the author's own map carries 17
+offices, and the seventeenth silently never got its range set.
+
+### Which offices get set, and why 3500
+
+Two kinds, and only two:
+
+| | |
+|---|---|
+| still at `game_default` | the player has never touched this office |
+| still at `written_range` | this plugin set it, in this session or an earlier one |
+
+Anything else is a number the player chose in the office window, and it is left
+alone. That is the whole of what makes `office_range` a default rather than a cage,
+and it is designed behaviour rather than a gap: a plugin that overwrote a
+hand-adjusted office every frame would be taking the `−` button away.
+
+The second kind is why `written_range` is written back into the ini. Without it,
+every office the plugin has ever touched reads as hand-adjusted the moment you change
+`office_range`, and the setting would only ever govern offices that do not exist yet.
+With it, lowering `office_range` walks the plugin's own offices back down — nothing
+in the write path is raise-only.
+
+**`game_default` ships as 3500** on two pieces of evidence: 3500 is what the
+pre-write probe read out of `+0xFC8` on every office it ever looked at, and it is
+what the executable's own validator puts there — `mov [rsi+0xFC8],3500`, the same
+instruction that names the offset. **1000 sat here for a while and was wrong**, and
+its provenance is worth writing down because it is the sort of number that looks
+sourced. It came off the `+`/`−` button ladder — `100 → r9d → 2000 → 3000 → ceiling`,
+where `r9d` is the one rung the handler computes at run time rather than carrying as
+an immediate, so the disassembly does not name it. 1000 was a guess at that rung. It
+is not one of the rungs, and it was never a value any office was observed starting
+at; two different unsourced things at once.
+
+The one-minute check that would finish the argument, on a fresh map: set
+`write_range = 0` and `raise_ceiling = 0`, start a new map, build one construction
+office and read the number in its own window. If it says something other than 3500,
+exactly two literals move — the default in `construction.cpp` and the `game_default`
+line in `construction.ini`.
 
 ## What a save keeps
 
-Which sites an office has taken on is in the save, not derived from the map. Removing
-the plugin restores the cap for every assignment made from then on, while offices that
-already took more keep them until those sites finish. **The save format is unchanged**,
-so a save stays loadable with or without this plugin — unlike a resource being added.
+**The range is in the save.** `+0xFC8` is a field on the office, the office is in the
+save, and the value survives a save and a reload the same way the number you set with
+the `−` and `+` buttons does — because it *is* that number.
+
+So a raise is permanent, and this page will not pretend otherwise:
+
+- an office set to 10 km stays at 10 km on the next load, with the plugin;
+- it stays at 10 km with the plugin removed and the DLL deleted;
+- there is no restore-on-uninstall, because there is nothing to restore *from* — the
+  plugin never keeps a copy of what the field was.
+
+The two ways back down are the office's own `−` button, which the plugin respects,
+and lowering `office_range` and letting the plugin follow its own writes — an office
+still holding `written_range` is set to whatever `office_range` now says, downwards
+included.
+
+Which sites an office has taken on is likewise in the save and not derived from the
+map, so `office_limit`, if it is ever wired to an address, would have the same shape:
+assignments already made are kept. **The save format is unchanged** either way, so a
+save stays loadable with or without this plugin — unlike a resource being added.
 
 ## What the log says
 
-Armed, before anything has been found:
+Startup, on the shipped defaults — the ceiling patch happens here, before a map is
+even loaded, and the `ready` line reports what will actually happen rather than what
+was asked for:
 
 ```
-plugin   construction     0.1 (probe) from construction.dll
+plugin   construction     1.0      from construction.dll
 construct  game object 0x9D4F10 confirmed by the lea at 0x43970A
-construct  ready: probe armed - it reads the offices and changes nothing
+construct  ceiling: 7 of 7 site(s) raised from 3500 to 10000 - the office window's
+           + button now goes that far
+construct  ready: a construction office starting at the game's 3500 m will be set to
+           10000 m (its own window stops at 10000, and lowering one by hand sticks)
 construct  612 building(s), 0 with no readable type
 construct  types on this map: 2 x381  3 x44  6 x22  12 x3  28 x1  43 x2
 ```
@@ -291,7 +369,51 @@ build and that offices were found. `12 x0` means the offset is wrong and every l
 line is noise — [02-findings.md](02-findings.md) records that a previous claim about
 that very offset was a guess and was wrong.
 
-A report:
+With `ceiling = 3500`, the seven sites are still verified and none is written — the
+executable is left exactly as it shipped, and the line says so rather than reporting
+a raise "from 3500 to 3500":
+
+```
+construct  ceiling: 3500 is what the game already stops at - all 7 site(s) verified
+           and none rewritten, the executable is untouched
+```
+
+Then the writes themselves. One line per office, on the first pass that touches it,
+and one line for the pass:
+
+```
+construct  range: office 0000029F4C8A1200 was at 3500 m, set to 10000 m
+construct  range: office 0000029F4C8B7A80 was at 3500 m, set to 10000 m
+construct  range: 2 office(s) at the game's default of 3500 raised to 10000 m -
+           lower any of them in its own window and it stays lowered
+construct  range: written_range = 10000 noted in construction.ini - an office holding
+           that is this plugin's own work, and follows office_range the next time you
+           change it
+```
+
+`was at` is the load-bearing half of the per-office line. Without it the log said what
+a range became and never what it had been, which is how a disagreement about the
+game's own default became an argument settled by git archaeology.
+
+The second session, after you have edited `office_range` down to 8000, is where
+`written_range` earns its keep — the offices this plugin set are still its own, and
+follow:
+
+```
+construct  ready: an office starting at the game's 3500 m, or still holding the 10000
+           this plugin wrote last, will be set to 8000 m (its own window stops at
+           10000, and lowering one by hand sticks)
+construct  range: office 0000029F4C8A1200 was at 10000 m, set to 8000 m
+construct  range: 2 office(s) set to 8000 m - the ones still at the game's 3500, and
+           the ones still holding the 10000 this plugin wrote last. Lower any of them
+           in its own window and it stays lowered.
+```
+
+An office you moved by hand appears in neither list, and no line is printed about it
+at all — that is the design, not an omission.
+
+A report from the probe, which is diagnostic now and answers questions the field
+write made unnecessary:
 
 ```
 construct  ---- day 143 of year 1962: 1 office(s), 41 live site(s) ----
@@ -324,12 +446,27 @@ construct  office 000002...: held 8 over 3 report(s) with 33 site(s) unclaimed -
 ```
 
 A refusal, in the project's usual voice — the address, what was found, what was
-expected, then `refusing`:
+expected, then `refusing`. The first line is the whole plugin standing down; the
+second is the ceiling patch standing down on its own, which is what a game update
+looks like from here, and it happens before any of the seven is written:
 
 ```
 construct  game object: rva 0x43970A points at 0x9D5010, expected 0x9D4F10 - refusing
-construct  office assign cap: 0x... holds 20, expected 12 - refusing
-construct  office: 2 site(s) did not verify - nothing written
+construct  ceiling: plus compare at rva 0x76C7C5 does not match this build - refusing
+construct           found: 41 8B 0C 24 81 F9 B8 0B 00 00
+construct  range: 1 office(s) refused - +0xFC8 did not hold a plausible range
+           (100..20000), so it is not being written
+construct  cap: no address for "office assign cap" yet - run with probe = 1
+```
+
+And the one that means a building went away between one frame and the next, which the
+plugin treats as a reason to stop touching that pointer rather than a reason to
+panic:
+
+```
+construct  range: 1 cached office pointer(s) no longer validate - demolished since
+           the last probe, most likely. They are left alone until the building
+           vector hands them back.
 ```
 
 ## Testing it

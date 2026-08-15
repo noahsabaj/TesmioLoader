@@ -34,7 +34,7 @@ started with:
 | `accumulator` | batteries for the electric grid | [10](10-accumulator.md) |
 | `needs` | resources the citizens buy in a shop | [11](11-needs.md) |
 | `walking` | how far a citizen walks | [12](12-walking.md) |
-| `buildings` | new buildings, written out of a config file | [13](13-buildings.md) |
+| `buildings` | **parked.** New buildings, written out of a config file | [13](13-buildings.md) |
 | `cities` | a per-city radius and shape | [14](14-cities.md) |
 | `daynight` | one sunrise and one sunset per calendar day | [15](15-daynight.md) |
 | `easystart` | needs that arrive with the century | [16](16-easystart.md) |

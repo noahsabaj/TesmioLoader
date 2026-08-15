@@ -10,15 +10,28 @@ in `tesmioloader/ghidra/proj`. Both used to sit in a session scratchpad under
 
 ## `tools/` and `ghidra/` are not in this repository
 
-Both are in `.gitignore` and have been since the first commit, so **every
-`tools/…` path in this file and in the rest of `docs/` names a script you will
-not find in your checkout.** They are on the author's machine only.
+Both are in `.gitignore`, so **every `tools/…` path in this file and in the rest
+of `docs/` names a script you will not find in your checkout.** They are on the
+author's machine.
 
-This is deliberate rather than an oversight, and nothing is lost by it:
+**Not since the first commit, though**, and the difference is worth stating
+rather than tidying away. The first commit's `.gitignore` was a single comment
+line. Twenty-four `tools/…` scripts were then tracked for two days, from
+`refactoring v0.2` on 28 July 2026 until `del dev rubbish` on the 30th removed
+them and added the `tools/` and `ghidra/` patterns that have been there since.
+So they are in the history and `git log --diff-filter=D -- 'tools/*'` will hand
+them back — a checkout of `HEAD` is what does not have them.
+
+Two things were *never* tracked, which is the half that matters: the Ghidra
+project has no commit of any kind behind it, and neither does
+`tools/signing/tsm_private.bin`. The private half of the release key has never
+been in this repository.
+
+The absence is deliberate rather than an oversight, and nothing is lost by it:
 
 - The **Ghidra project** is a derived artifact. It regenerates from your own
   copy of `SOVIET64.exe` in a few minutes of analysis — see
-  [Ghidra](#4-ghidra--when-the-others-run-out) below.
+  [Ghidra](#4-ghidra--for-control-flow-that-has-to-be-read) below.
 - The **Python helpers** (`tools/pe/*.py`, `tools/assets/*.py`) are small
   single-purpose scripts, and this page spells out what each one does and the
   arguments it takes. Rewriting the one you need is an afternoon at most, and
