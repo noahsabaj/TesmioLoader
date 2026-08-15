@@ -385,7 +385,7 @@ static const Group kLimitGroup = {
 
 static int g_enabled  = 1;
 static int g_patch    = 0;      // the second half; off until the table is filled
-static int g_probe    = 1;      // and the first half, which is what 0.1 is for
+static int g_probe    = 1;      // and the first half, which is what found +0xFC8
 
 static int g_officeRange = 10000;  // metres of reach. The point of the plugin
 static int g_officeLimit = 0;      // 0 = no cap at all
@@ -398,6 +398,46 @@ static int g_officeLimit = 0;      // 0 = no cap at all
 static int g_raiseCeiling = 1;
 static int g_ceiling      = 10000;
 
+// Set office_range into a construction office. This is the feature, and it is
+// the one thing in this plugin that writes to the game.
+static int g_writeRange = 1;
+
+// What a construction office starts life at, in the base game. An office still
+// carrying this has not been touched by the player, and is one of the two kinds
+// this plugin raises - which is what makes office_range a DEFAULT rather than a
+// value the plugin holds you to.
+//
+// 3500, because 3500 is what the pre-write probe read out of +0xFC8 on every
+// office it ever looked at, and what the executable's own validator pins the
+// field to - `mov [rsi+0xFC8],3500`, up at RVA_CLAMP_SET_A. 1000 sat here for a
+// while and was wrong: a guess at the ladder's one run-time rung (the rungs the
+// disassembly names are 100, 2000 and 3000), never a value any office was
+// observed starting at.
+//
+// 0 means "no such test": every office is held at office_range every frame,
+// and the minus button in its window then cannot lower it, because the next
+// frame puts the value straight back. That was version 0.1's behaviour and it
+// was wrong - it was insurance against a re-clamp the game turns out not to
+// do.
+static int g_gameDefault = 3500;
+
+// The other kind: an office holding the value THIS PLUGIN last wrote.
+//
+// That office is the plugin's own work rather than the player's, so when
+// office_range changes it should follow - otherwise every office the plugin has
+// ever touched is frozen at whatever the ini said the day it was built, and the
+// setting only governs offices that do not exist yet.
+//
+// It has to survive the process to be worth anything, so it lives in the ini,
+// written back by the plugin after a write pass. The launcher already persists
+// [plugins] the same way; the profile API edits in place and never adds a BOM,
+// so the comments in the shipped file survive.
+//
+// 0 means the key is absent - a first run, and then only the game_default test
+// applies. It is also ignored when it equals g_gameDefault, where it would
+// claim nothing the first test does not already claim.
+static int g_writtenRange = 0;
+
 // The value to hunt for in a construction office, as an int and as a float.
 //
 // This is the shortcut the office's own window handed us: it shows the
@@ -407,22 +447,6 @@ static int g_ceiling      = 10000;
 // beats inferring one from behaviour by a wide margin.
 //
 // 0 turns the hunt off.
-// Set office_range into a construction office. This is the feature, and it is
-// the one thing in this plugin that writes to the game.
-static int g_writeRange = 1;
-
-// What a construction office starts life at, in the base game. An office still
-// carrying this has not been touched by the player, and is the only kind this
-// plugin raises - which is what makes office_range a DEFAULT rather than a
-// value the plugin holds you to.
-//
-// 0 means "no such test": every office is held at office_range every frame,
-// and the minus button in its window then cannot lower it, because the next
-// frame puts the value straight back. That was version 0.1's behaviour and it
-// was wrong - it was insurance against a re-clamp the game turns out not to
-// do.
-static int g_gameDefault = 1000;
-
 static int g_probeExpect = 3500;
 
 // Report every 4-byte slot of an office that changed since the last report,
@@ -443,7 +467,10 @@ static int g_rdataTo   = 0x90C000;
 
 // ---------------------------------------------------------------- state
 
-#define MAX_OFFICES   16
+// 16 was a probe-era number and Noah's own map already carries 17, which meant
+// the seventeenth office silently never got its range set. The WARN below still
+// fires past this - a cap you can hit is a cap worth being told about.
+#define MAX_OFFICES   64
 #define OFFICE_SNAP   0x1800    // bytes of an office kept for the field diff
 #define MAX_LIVE      2048      // live construction sites tracked in one report
 #define MAX_ELEMS     256       // most members a candidate list may hold
@@ -485,6 +512,8 @@ struct Office
     int   scanned;      // the .rdata hunt is done once per bracket, not per report
 
     int   raised;       // decided about once, and never reconsidered
+    int   announced;    // the before-and-after line is logged on the first write
+    int   dropped;      // failed validation; untouched until the vector re-finds it
     int   hunted;       // the value hunt is done once per office, not per report
     int   haveSnap;
     DWORD snapLen;      // how much of `snap` the last snapshot actually filled
@@ -814,47 +843,124 @@ static int ScanOffice(BYTE* b, DWORD extent, BYTE** bvBegin, int bvCount,
 
 // ---------------------------------------------------------------- writing it
 //
-// The range is a plain int on the office, so the first thing to try is simply
-// setting it - no spliced code, no repointed constant, nothing that a game
-// update can move. `cities` does the same kind of thing for a city's radius.
-//
-// Whether it STICKS is the open question, and this is also the experiment that
-// answers it: the value is written, read back on the next pass, and any
-// disagreement is reported. If the simulation clamps it to 3500 the log says
-// so in as many words, and the answer is then a code patch on whatever does
-// the clamping.
+// The range is a plain int on the office, so the thing to do is simply set it -
+// no spliced code, no repointed constant, nothing that a game update can move.
+// `cities` does the same kind of thing for a city's radius. It sticks: the
+// value was written, read back on the next pass, and the simulation never put
+// it back.
 //
 // This is the one place in the plugin that writes to the game. It is off
-// unless `write_range` says otherwise, and it refuses an office whose current
-// value is not a plausible range - if 0xFC8 ever stops being this field, that
-// guard is what stops the plugin writing into a stranger's structure.
+// unless `write_range` says otherwise, and every pointer it touches is
+// re-validated on the frame it is used - see ValidateOffice.
 
 static int  g_wroteOnce;
 static int  g_clampReported;
 static int  g_refusedReported;
+static int  g_staleReported;
+static int  g_persisted;
+
+#define INI_NAME "plugins\\construction.ini"
+
+// The plugin's own bookkeeping, written back into the file it read.
+//
+// The launcher persists [plugins] this way already. The profile API edits in
+// place and never writes a BOM, so the comments in the shipped ini survive -
+// which is the whole reason this is not done by rewriting the file.
+//
+// Called at most once a session, on the first pass that actually wrote
+// something, so an ordinary game touches the file once and a game that changes
+// no office touches it never.
+static void PersistWrittenRange(int value)
+{
+    char ini[MAX_PATH];
+    char num[16];
+    _snprintf_s(ini, sizeof(ini), _TRUNCATE, "%s\\%s", g_baseDir, INI_NAME);
+    _snprintf_s(num, sizeof(num), _TRUNCATE, "%d", value);
+
+    if (WritePrivateProfileStringA("construction", "written_range", num, ini))
+        Logf("construct  range: written_range = %d noted in construction.ini - an "
+             "office holding that is this plugin's own work, and follows "
+             "office_range the next time you change it", value);
+    else
+        Logf("construct  range: could not note written_range in %s (error %lu) - the "
+             "offices set this session will look hand-adjusted next time and will "
+             "not follow office_range", ini, GetLastError());
+}
+
+// Is this cached pointer still a construction office, this frame?
+//
+// g_office[] is refreshed from the building vector once every probe_period
+// seconds while this runs on EVERY frame, so a pointer in it can be five
+// seconds stale - and a building demolished inside that window has been freed.
+// Writing through it would be a write into freed memory, which is the worst
+// thing this plugin could do, so nothing is dereferenced until it has been
+// re-checked here:
+//
+//   the head of the object is readable, and so is the field
+//   the type descriptor still reads as the same BUILDINGTYPE_* the probe matched
+//   the demolition flag is clear
+//   +0xFC8 still holds something that could be a range in metres
+//
+// Returns 1 for a good office, 0 for one that no longer validates, and -1 for
+// one that is still an office but whose +0xFC8 is not a plausible range - the
+// separation matters, because the first is routine and the second means 0xFC8
+// may have stopped being this field.
+//
+// The residual risk is real and cannot be closed from here: freed memory the
+// allocator has since handed to another building of the same type reads exactly
+// like the original and passes every check above. What the checks do buy is
+// that a wild write cannot land in a freed-and-unreused block, in a different
+// kind of object, or in a page that has been decommitted - which is how this
+// actually fails - and that the window for the one remaining case is a frame
+// rather than a probe period.
+static int ValidateOffice(Office* o, int* outRange)
+{
+    BYTE* b = o->building;
+    if (!b) return 0;
+    if (!ReadablePtr(b, 8)) return 0;
+
+    // The same type this office was collected as, not merely one of the two:
+    // an office is never one and then the other, so a change is a different
+    // object at the same address.
+    int t = BuildingType(b);
+    if (t != o->type) return 0;
+    if (t != BT_OFFICE && t != BT_OFFICE_RAIL) return 0;
+
+    if (!ReadablePtr(b + B_DEMOLISHED, 1)) return 0;
+    if (*(const char*)(b + B_DEMOLISHED) != 0) return 0;
+
+    if (!ReadablePtr(b + B_OFFICE_RANGE, 4)) return 0;
+
+    // The invariant that keeps a wrong offset from becoming a wild write:
+    // whatever is here has to look like a range in metres. The game's own
+    // values run to 3500 and the plugin's own ceiling is RANGE_MAX.
+    int now = *(const int*)(b + B_OFFICE_RANGE);
+    if (now < 100 || now > RANGE_MAX) return -1;
+
+    *outRange = now;
+    return 1;
+}
 
 static void WriteRanges(void)
 {
     if (!g_writeRange || g_officeRange <= 0) return;
 
-    int wrote = 0, clamped = 0, refused = 0;
+    int wrote = 0, clamped = 0, refused = 0, stale = 0;
 
     for (int i = 0; i < g_offices; i++)
     {
         Office* o = &g_office[i];
-        BYTE*   b = o->building;
-        if (!b) continue;
 
         // Decided once, and never reconsidered - but ONLY in default mode.
         //
         // This is the fix for a bug that was mine: the rule used to be "raise
-        // anything sitting at the game's default", and the minus button's own
-        // bottom rung IS that default. So stepping an office down to 1000 by
-        // hand looked identical to a freshly built one, and the plugin put it
-        // straight back to 10000 - which made the minus button cycle 3500,
-        // 3000, 2000, 10000 for ever. "Have we already made a decision about
-        // this office" is the honest question, and the value alone could never
-        // answer it.
+        // anything sitting at the game's default" with 1000 written down as
+        // that default - a guess, and any guess the ladder can land an office
+        // on sets the same trap: stepping one down by hand looks identical to
+        // a freshly built one, and the plugin puts it straight back to 10000,
+        // cycling the minus button for ever. "Have we already made a decision
+        // about this office" is the honest question, and the value alone could
+        // never answer it.
         //
         // With `game_default = 0` there is no such question to ask: the
         // documented behaviour there is that every office is HELD at
@@ -862,40 +968,82 @@ static void WriteRanges(void)
         // It used to, unconditionally, which quietly made game_default = 0
         // behave identically to the default mode - and took the re-clamp
         // detection below down with it, since a raised office never reached it.
+        //
+        // Before the pointer, because this costs nothing and dereferencing does.
         if (g_gameDefault > 0 && o->raised) continue;
 
-        // Still an office, and still readable. The building vector is walked
-        // fresh every report, but this runs between reports too.
-        int t = BuildingType(b);
-        if (t != BT_OFFICE && t != BT_OFFICE_RAIL) continue;
-        if (!ReadablePtr(b + B_OFFICE_RANGE, 4)) continue;
+        // Already dropped this probe period, in every mode. Re-validating it
+        // every frame would cost the VirtualQueries and count the same office
+        // as stale over and over.
+        if (o->dropped) continue;
 
-        int now = *(const int*)(b + B_OFFICE_RANGE);
-        if (now == g_officeRange) continue;             // already ours
-
-        // The invariant that keeps a wrong offset from becoming a wild write:
-        // whatever is here has to look like a range in metres. The game's own
-        // values run to 3500 and the plugin's own ceiling is RANGE_MAX.
-        if (now < 100 || now > RANGE_MAX)
+        int now = 0;
+        int ok  = ValidateOffice(o, &now);
+        if (ok <= 0)
         {
-            refused++;
+            // Dropped rather than retried: whatever this address is now, it is
+            // not something to keep poking at frame after frame. CollectOffices
+            // clears the flag when the building vector hands the pointer back,
+            // which is the only evidence that the game still owns it.
+            o->dropped = 1;
+            if (ok < 0) refused++; else stale++;
             continue;
         }
 
-        // A DEFAULT, NOT A CAGE. An office already carrying something other
-        // than the game's starting value was set by the player - on this map
-        // or in an earlier session, since the value is saved - so it is theirs.
-        // Mark it decided and never look at it again.
-        if (g_gameDefault > 0 && now != g_gameDefault)
+        BYTE* b = o->building;
+        if (now == g_officeRange)                       // already ours
         {
             o->raised = 1;
             continue;
+        }
+
+        // A DEFAULT, NOT A CAGE - and two kinds of office qualify.
+        //
+        // An office still at the game's own starting value has not been touched
+        // by anybody. An office holding `written_range` is one this plugin set
+        // in an earlier session, and is therefore the plugin's work rather than
+        // the player's: when office_range changes, it follows - upwards or
+        // downwards, since nothing here is raise-only.
+        //
+        // Anything else was set by the player, on this map or in an earlier
+        // session since the value is saved, so it is theirs. Mark it decided
+        // and never look at it again.
+        //
+        // The honest limit: an office the player deliberately set to exactly
+        // `written_range` is indistinguishable from one the plugin set, and this
+        // claims it. construction.ini says so outright.
+        if (g_gameDefault > 0)
+        {
+            bool untouched = (now == g_gameDefault);
+
+            // written_range == game_default claims nothing the first test does
+            // not already claim, and 0 means the key was never written.
+            bool ours = (g_writtenRange > 0 &&
+                         g_writtenRange != g_gameDefault &&
+                         now == g_writtenRange);
+
+            if (!untouched && !ours)
+            {
+                o->raised = 1;
+                continue;
+            }
         }
 
         // Holding mode only: anything other than the value we last put here is
         // the game putting it back. Reachable now that `raised` no longer skips
         // the office on every pass after the first.
         if (g_wroteOnce && g_gameDefault <= 0) clamped++;
+
+        // The before-and-after, once per office. This is the line whose absence
+        // turned a disagreement about the game's own default into an argument
+        // settled by git archaeology: the log said what the range became and
+        // never what it had been.
+        if (!o->announced)
+        {
+            Logf("construct  range: office %p was at %d m, set to %d m",
+                 b, now, g_officeRange);
+            o->announced = 1;
+        }
 
         *(int*)(b + B_OFFICE_RANGE) = g_officeRange;
         o->raised = 1;
@@ -911,7 +1059,12 @@ static void WriteRanges(void)
     // behaviour does not change, and one line describes all of it.
     if (wrote)
     {
-        if (g_gameDefault > 0)
+        if (g_gameDefault > 0 && g_writtenRange > 0 && g_writtenRange != g_gameDefault)
+            Logf("construct  range: %d office(s) set to %d m - the ones still at the "
+                 "game's %d, and the ones still holding the %d this plugin wrote "
+                 "last. Lower any of them in its own window and it stays lowered.",
+                 wrote, g_officeRange, g_gameDefault, g_writtenRange);
+        else if (g_gameDefault > 0)
             Logf("construct  range: %d office(s) at the game's default of %d raised to "
                  "%d m - lower any of them in its own window and it stays lowered",
                  wrote, g_gameDefault, g_officeRange);
@@ -922,6 +1075,20 @@ static void WriteRanges(void)
         g_wroteOnce = 1;
     }
 
+    // Once a session, and only after something was actually written: the value
+    // recorded has to be one that really is sitting in an office, or the next
+    // session would follow a number nothing holds.
+    //
+    // g_writtenRange itself is deliberately NOT updated. It is what the ini said
+    // when the game started, and it is what offices set in an EARLIER session
+    // are still holding - moving it here would stop recognising the ones on a
+    // map that has not been loaded yet.
+    if (wrote && !g_persisted)
+    {
+        if (g_officeRange != g_writtenRange) PersistWrittenRange(g_officeRange);
+        g_persisted = 1;
+    }
+
     // Rate-limited for the same reason: a wrong offset is wrong on every frame,
     // and one line says so as well as ten thousand would.
     if (refused && !g_refusedReported)
@@ -930,6 +1097,14 @@ static void WriteRanges(void)
              "range (100..%d), so it is not being written",
              refused, B_OFFICE_RANGE, RANGE_MAX);
         g_refusedReported = 1;
+    }
+
+    if (stale && !g_staleReported)
+    {
+        Logf("construct  range: %d cached office pointer(s) no longer validate - "
+             "demolished since the last probe, most likely. They are left alone "
+             "until the building vector hands them back.", stale);
+        g_staleReported = 1;
     }
 
     // Holding mode only, and reported once rather than every frame: whatever is
@@ -1112,6 +1287,12 @@ static int CollectOffices(BYTE** begin, int count)
 
         keep.building = b;
         keep.type     = t;
+
+        // The building vector still holds this pointer, which is the only
+        // evidence there is that the game still owns the object - so an office
+        // WriteRanges dropped mid-probe-period is back in play from here.
+        keep.dropped  = 0;
+
         g_office[n++] = keep;
     }
 
@@ -1573,15 +1754,22 @@ static bool WriteSite(const Site* s, float* slot, double value)
 
 // All seven or none - four validator sites and the three rungs the buttons
 // actually walk. Each site individually is a short byte run that could in
-// principle occur elsewhere; what makes the set trustworthy is that four of
-// the seven carry the 0xFC8 displacement and all of them sit at fixed
-// addresses in this build. Verifying them together and writing only on a clean
-// sweep is also what stops the half-patched state where the validator honours
-// one ceiling and the button ladder stops at another.
+// principle occur elsewhere; what makes the set trustworthy is that three of
+// the seven carry the 0xFC8 displacement - the two validator stores and the
+// second compare, which are the ones that name the field - and that all seven
+// sit at fixed addresses in this build. Verifying them together and writing
+// only on a clean sweep is also what stops the half-patched state where the
+// validator honours one ceiling and the button ladder stops at another.
 //
 // The write loop is deliberately after the whole verify loop. A VirtualProtect
 // that fails partway still leaves earlier sites written, which is why the
 // failure is logged loudly rather than returned quietly.
+//
+// Returns whether anything was actually REWRITTEN, which is not the same as
+// whether the ceiling is where it was asked to be: with `ceiling = 3500` every
+// site already holds the target and there is nothing to do. The caller reports
+// the window's real ceiling from this, so it must not claim a lift that never
+// happened.
 static bool PatchClamp(void)
 {
     for (int i = 0; i < (int)CLAMP_SITE_COUNT; i++)
@@ -1609,6 +1797,18 @@ static bool PatchClamp(void)
             Logf("construct           found: %s", hex);
             return false;
         }
+    }
+
+    // Every site verified, and every one of them holds 3500. If that is also
+    // what was asked for there is nothing to write - seven VirtualProtects to
+    // put back the bytes already there, and a line saying the ceiling was
+    // "raised from 3500 to 3500", which is how a no-op reads as a patch.
+    if (g_ceiling == VANILLA_RANGE_MAX)
+    {
+        Logf("construct  ceiling: %d is what the game already stops at - all %d site(s) "
+             "verified and none rewritten, the executable is untouched",
+             g_ceiling, (int)CLAMP_SITE_COUNT);
+        return false;
     }
 
     for (int i = 0; i < (int)CLAMP_SITE_COUNT; i++)
@@ -1683,7 +1883,7 @@ static void h_TerrainRender(void* self, bool a, void* cam1, void* cam2, int b, i
 
 static void ReadSettings(void)
 {
-    const char* ini = "plugins\\construction.ini";
+    const char* ini = INI_NAME;
 
     g_enabled     = H->configInt(ini, "construction", "enabled",      g_enabled);
     g_patch       = H->configInt(ini, "construction", "patch",        g_patch);
@@ -1699,6 +1899,7 @@ static void ReadSettings(void)
     g_probeDiff   = H->configInt(ini, "construction", "probe_diff",   g_probeDiff);
     g_writeRange  = H->configInt(ini, "construction", "write_range",  g_writeRange);
     g_gameDefault = H->configInt(ini, "construction", "game_default", g_gameDefault);
+    g_writtenRange = H->configInt(ini, "construction", "written_range", g_writtenRange);
     g_raiseCeiling = H->configInt(ini, "construction", "raise_ceiling", g_raiseCeiling);
     g_ceiling      = H->configInt(ini, "construction", "ceiling",       g_ceiling);
     g_rdataFrom   = H->configInt(ini, "construction", "rdata_from",   g_rdataFrom);
@@ -1730,6 +1931,12 @@ static void ReadSettings(void)
              g_officeRange, RANGE_MAX);
         g_officeRange = RANGE_MAX;
     }
+    // The plugin's own bookkeeping, so it is only ever trusted inside the band
+    // the plugin could have written. Anything else - a hand-edited key, a 0 from
+    // a file that has never had one - means "no earlier value to recognise",
+    // which is the first-run behaviour.
+    if (g_writtenRange < 100 || g_writtenRange > RANGE_MAX) g_writtenRange = 0;
+
     if (g_rdataFrom < 0)          g_rdataFrom = 0;
     if (g_rdataTo <= g_rdataFrom) g_rdataTo = g_rdataFrom + 0x1000;
 }
@@ -1803,7 +2010,17 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
 
     // The office window's own ceiling. Independent of the site tables below -
     // this one has real addresses and they are verified byte for byte.
-    if (g_raiseCeiling && PatchClamp()) written++;
+    //
+    // What the window really stops at, which is what the ready line below must
+    // report: the ceiling asked for only if the seven sites were actually
+    // rewritten. A refusal, or a `ceiling` that was already the game's own 3500,
+    // both leave the button where the game shipped it.
+    int windowCeiling = VANILLA_RANGE_MAX;
+    if (g_raiseCeiling && PatchClamp())
+    {
+        windowCeiling = g_ceiling;
+        written++;
+    }
 
     if (g_patch)
     {
@@ -1830,11 +2047,15 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         Logf("construct  WARN write_range is on but the render hook could not be "
              "installed - no office range will be set. Only the window ceiling, "
              "if it was raised, is in effect.");
+    else if (g_writeRange && g_gameDefault > 0 && g_writtenRange)
+        Logf("construct  ready: an office starting at the game's %d m, or still holding "
+             "the %d this plugin wrote last, will be set to %d m (its own window stops "
+             "at %d, and lowering one by hand sticks)",
+             g_gameDefault, g_writtenRange, g_officeRange, windowCeiling);
     else if (g_writeRange && g_gameDefault > 0)
         Logf("construct  ready: a construction office starting at the game's %d m will "
              "be set to %d m (its own window stops at %d, and lowering one by hand "
-             "sticks)", g_gameDefault, g_officeRange, g_raiseCeiling ? g_ceiling
-                                                                    : VANILLA_RANGE_MAX);
+             "sticks)", g_gameDefault, g_officeRange, windowCeiling);
     else if (g_writeRange)
         Logf("construct  ready: every office held at %d m - `game_default = 0`, so they "
              "cannot be lowered by hand", g_officeRange);
