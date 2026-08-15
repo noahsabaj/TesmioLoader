@@ -25,7 +25,7 @@ cd /d "%~dp0"
 if not exist build mkdir build
 
 echo [build] tesmioloader.dll
-cl /nologo /O2 /MT /W3 /EHsc /LD ^
+cl /nologo /O2 /MT /W4 /EHsc /LD ^
    /Fo"build\\" /Fd"build\\" /Fe"build\tesmioloader.dll" ^
    src\tesmioloader.cpp /link kernel32.lib
 if errorlevel 1 ( echo [build] tesmioloader.dll FAILED & exit /b 1 )
@@ -51,7 +51,7 @@ if exist build\tesmiolauncher.res (
     set LAUNCHER_RES=
     echo [build] rc.exe unavailable - launcher built without its icon
 )
-cl /nologo /O2 /MT /W3 /EHsc ^
+cl /nologo /O2 /MT /W4 /EHsc ^
    /Fo"build\\" /Fd"build\\" /Fe"build\tesmiolauncher.exe" ^
    src\tesmiolauncher.cpp %LAUNCHER_RES% /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED kernel32.lib
 if errorlevel 1 ( echo [build] tesmiolauncher.exe FAILED & exit /b 1 )
@@ -65,7 +65,7 @@ rem must still build, so a missing tsmsign.cpp skips the tool rather than
 rem failing the build.
 if exist tools\signing\tsmsign.cpp if exist src\tesmio_sign.h (
     echo [build] tsmsign.exe
-    cl /nologo /O2 /MT /W3 /EHsc ^
+    cl /nologo /O2 /MT /W4 /EHsc ^
        /Fo"build\\" /Fd"build\\" /Fe"build\tsmsign.exe" ^
        tools\signing\tsmsign.cpp /link kernel32.lib
     if errorlevel 1 ( echo [build] tsmsign.exe FAILED & exit /b 1 )
@@ -92,7 +92,7 @@ for /d %%P in (plugins\*) do (
         echo [build] plugins\buildings: skipped, parked - see build.bat
     ) else if exist "%%P\%%~nxP.cpp" (
         echo [build] plugins\%%~nxP.dll
-        cl /nologo /O2 /MT /W3 /EHsc /LD ^
+        cl /nologo /O2 /MT /W4 /EHsc /LD ^
            /Fo"build\plugins\\" /Fd"build\plugins\\" /Fe"build\plugins\%%~nxP.dll" ^
            "%%P\%%~nxP.cpp" /link kernel32.lib
         if errorlevel 1 ( echo [build] plugins\%%~nxP.dll FAILED & exit /b 1 )
@@ -123,13 +123,15 @@ rem checkboxes and the game path into it, so overwriting it on every build would
 rem throw away what the user chose. Copied only when it is not there yet - to
 rem pick up new defaults from the repo copy, delete it and build again.
 rem
-rem The repo-root tesmioloader.ini is NOT in this tree - it is one of the files
-rem gitignored from the first commit and never published. That is fine: the
-rem loader falls back to a compiled-in default for every key, and the launcher
-rem creates the file itself on the first launch. What was not fine was copying
-rem it unconditionally and ignoring the result, so the build printed "The system
-rem cannot find the file specified." near the end of an otherwise clean run and
-rem the only way to know that was harmless was to have been told.
+rem The repo-root tesmioloader.ini is NOT in this tree - it was tracked once and
+rem then deleted, and nothing in .gitignore covers it, so a contributor who
+rem recreates it will find it stageable rather than quietly skipped. That is
+rem fine: the loader falls back to a compiled-in default for every key, and the
+rem launcher writes build\tesmioloader.ini itself on the first launch, which is
+rem the copy that matters. What was not fine was copying it unconditionally and
+rem ignoring the result, so the build printed "The system cannot find the file
+rem specified." near the end of an otherwise clean run and the only way to know
+rem that was harmless was to have been told.
 if exist build\tesmioloader.ini (
     echo [build] build\tesmioloader.ini kept - delete it to take the repo defaults
 ) else if exist tesmioloader.ini (
